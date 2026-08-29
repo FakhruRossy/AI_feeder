@@ -37,6 +37,7 @@ dependencies:
   shared_preferences: ^2.2.3
   wakelock_plus: ^1.2.5
   cupertino_icons: ^1.0.8
+  screen_brightness: ^2.1.11
 
 dev_dependencies:
   flutter_test:
