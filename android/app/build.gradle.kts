@@ -7,7 +7,7 @@ plugins {
 
 android {
     namespace = "com.example.catfish"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {

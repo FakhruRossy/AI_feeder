@@ -2,30 +2,32 @@ import 'dart:typed_data';
 import 'package:camera/camera.dart';
 
 /// Port Dart dari compute_motion_energy() di motion_energy_pipeline.py:
-///   1. resize ke 160x120
-///   2. grayscale (Y-plane YUV420 kamera = sudah grayscale, gak perlu
-///      convert RGB dulu -- ini beda dari cv2 yang resize dulu baru
-///      convert BGR2GRAY, tapi hasilnya seharusnya cukup dekat)
-///   3. Gaussian blur 5x5
-///   4. diff absolut terhadap frame sebelumnya
-///   5. threshold biner (diffThreshold) -> hitung piksel yang "aktif"
+///   1. resize ke 160x120 (average-pooling di Y-plane)
+///   2. Gaussian blur 5x5
+///   3. diff absolut terhadap frame sebelumnya
+///   4. threshold biner (diffThreshold) -> hitung piksel yang "aktif"
 ///
-/// CATATAN JUJUR soal fidelity ke versi Python:
-/// - Resize: cv2.resize pakai interpolasi bilinear di atas frame BGR,
-///   di sini kita average-pooling langsung di atas Y-plane. Mendekati,
-///   TIDAK identik bit-per-bit.
-/// - Luma dari ISP kamera HP (biasanya BT.601/709) belum tentu identik
-///   dengan formula cv2.cvtColor(BGR2GRAY).
-/// - Gaussian kernel di bawah ini aproksimasi integer sigma~1 (kernel
-///   klasik 1-4-6-4-1), BUKAN cv2.GaussianBlur(ksize=5,sigma=0) yang
-///   sigma auto-computed persis 1.1.
-/// Karena itu skala raw score dari kamera HP KEMUNGKINAN BESAR beda dari
-/// video kalibrasi awal -- min_peak & decay_ratio wajib di-cek ulang
-/// pakai data real dari kamera HP (lihat Settings screen / logging).
+/// REVISI KALIBRASI (v2):
+/// - EMA & peak yang dulu ada di sini DIHAPUS. Satu-satunya EMA sekarang
+///   ada di feeder_trigger.dart, supaya tidak ada dua EMA dengan alpha
+///   berbeda (dulu extractor 0.25 vs config 0.15).
+/// - Selain skor stride-1 (frame vs frame sebelumnya), extractor menghitung
+///   skor STRIDE 2/4/8 (frame vs frame k langkah lalu) pada frame yang SAMA.
+///   Tujuannya: dari satu rekaman di fps dasar F, kita bisa menyimulasikan
+///   fps efektif F, F/2, F/4, F/8 secara adil (event yang sama, frame yang
+///   sama). Skor motion energy bergantung pada jarak waktu antar frame yang
+///   dibandingkan, jadi men-subsample deret skor stride-1 TIDAK sama dengan
+///   fps yang lebih rendah -- itu sebabnya stride dihitung langsung di sini.
+/// - processFrame() mengembalikan null untuk frame pertama (belum ada
+///   pembanding), BUKAN 0, supaya tidak meracuni EMA awal.
 class MotionEnergyExtractor {
   final int targetWidth;
   final int targetHeight;
   final int diffThreshold;
+
+  /// Stride yang dihitung. Urutan naik; yang terbesar menentukan ukuran
+  /// riwayat frame (8 frame x 19.2 KB = ~150 KB, murah).
+  static const List<int> strides = [1, 2, 4, 8];
 
   MotionEnergyExtractor({
     this.targetWidth = 160,
@@ -34,35 +36,52 @@ class MotionEnergyExtractor {
   });
 
   static const List<int> _kernel = [
-    1, 4, 6, 4, 1,
-    4, 16, 24, 16, 4,
-    6, 24, 36, 24, 6,
-    4, 16, 24, 16, 4,
+    1, 4, 6, 4, 1, //
+    4, 16, 24, 16, 4, //
+    6, 24, 36, 24, 6, //
+    4, 16, 24, 16, 4, //
     1, 4, 6, 4, 1,
   ];
   static const int _kernelSum = 256;
 
-  Uint8List? _prevBlurred;
+  /// Riwayat frame ter-blur, terlama di depan.
+  final List<Uint8List> _hist = <Uint8List>[];
 
-  /// Return raw motion energy score (jumlah piksel berubah signifikan).
-  /// Frame pertama SELALU return 0 -- sama seperti Python (scores.append(0)
-  /// waktu prev_gray masih None), bukan null, biar konsisten sama caller.
-  double processFrame(CameraImage image) {
+  /// Skor frame TERAKHIR per stride. -1 = belum ada pembanding yang cukup
+  /// jauh ke belakang (awal sesi / setelah reset()).
+  final Map<int, double> strideScores = {for (final s in strides) s: -1.0};
+
+  /// Return skor stride-1 (jumlah piksel berubah signifikan), atau null
+  /// untuk frame pertama setelah reset().
+  double? processFrame(CameraImage image) {
     final downsampled = _downsample(image);
     final blurred = _gaussianBlur5x5(downsampled, targetWidth, targetHeight);
 
-    double score = 0;
-    final prev = _prevBlurred;
-    if (prev != null) {
-      int active = 0;
-      for (int i = 0; i < blurred.length; i++) {
-        if ((blurred[i] - prev[i]).abs() > diffThreshold) active++;
+    for (final s in strides) {
+      if (_hist.length >= s) {
+        strideScores[s] = _countActive(
+          blurred,
+          _hist[_hist.length - s],
+        ).toDouble();
+      } else {
+        strideScores[s] = -1.0;
       }
-      score = active.toDouble();
     }
+    final double? result = _hist.isNotEmpty ? strideScores[1] : null;
 
-    _prevBlurred = blurred;
-    return score;
+    _hist.add(blurred);
+    while (_hist.length > strides.last) {
+      _hist.removeAt(0);
+    }
+    return result;
+  }
+
+  int _countActive(Uint8List a, Uint8List b) {
+    int active = 0;
+    for (int i = 0; i < a.length; i++) {
+      if ((a[i] - b[i]).abs() > diffThreshold) active++;
+    }
+    return active;
   }
 
   /// Average-pooling dari Y-plane resolusi asli kamera -> targetWidth x
@@ -122,7 +141,11 @@ class MotionEnergyExtractor {
     return out;
   }
 
+  /// Panggil di awal sesi / uji coba. Hanya membuang riwayat frame.
   void reset() {
-    _prevBlurred = null;
+    _hist.clear();
+    for (final s in strides) {
+      strideScores[s] = -1.0;
+    }
   }
 }
