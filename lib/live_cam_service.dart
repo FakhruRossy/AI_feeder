@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show compute;
@@ -25,6 +26,20 @@ import 'dev_log.dart';
 /// J2 di sini HANYA membaca presence (siapa saja viewer yang nge-`track()`
 /// dirinya di channel ini) -- J2 SENDIRI TIDAK ikut track() presence,
 /// karena J2 bukan "viewer", J2 publisher.
+///
+/// 🟢 REVISI (P1 / SPEC 3.4) -- tambahan, API publik lama TIDAK berubah:
+///  1. Re-subscribe otomatis saat channel closed/timedOut/channelError
+///     (jeda 5 dtk, backoff ganda sampai 60 dtk). Presence dihitung ulang
+///     setiap channel kembali `subscribed`.
+///  2. Ping viewer OPSIONAL: bila viewer mengirim broadcast event `ping`,
+///     viewer dianggap hilang kalau 60 dtk tanpa ping (menangkap tab yang
+///     "zombie" tapi socket-nya belum di-leave server). Kalau ping tidak
+///     pernah datang (webapp lama) => perilaku presence saja, seperti dulu.
+///  3. Batas durasi kirim frame berkelanjutan `maxMinutes` (default 30,
+///     0 = tanpa batas, clamp 0..240). Lewat batas: berhenti kirim frame dan
+///     onWatchersChanged(false) (channel tetap subscribe); lanjut lagi saat
+///     ada presence JOIN baru. Pengecekan dilakukan di sendFrame (sudah
+///     periodik) sehingga tidak butuh timer tambahan.
 class LiveCamService {
   final SupabaseClient _client = Supabase.instance.client;
   RealtimeChannel? _channel;
@@ -32,7 +47,7 @@ class LiveCamService {
   /// Dipanggil setiap kali status "ada viewer aktif" berubah (true/false).
   /// HANYA dipanggil saat nilainya benar-benar berubah (bukan tiap sync
   /// event Presence, yang bisa nembak berkali-kali walau isinya sama --
-  /// lihat guard `_lastActive` di [_handlePresenceChange]).
+  /// lihat guard `_lastActive` di [_recompute]).
   final void Function(bool active) onWatchersChanged;
 
   final void Function(LogDirection direction, String channel, String message)?
@@ -40,47 +55,205 @@ class LiveCamService {
 
   final String channelName;
 
+  // 🟢 REVISI: konstanta SPEC 3.4
+  static const Duration kResubscribeMin = Duration(seconds: 5);
+  static const Duration kResubscribeMax = Duration(seconds: 60);
+  static const Duration kPingTimeout = Duration(seconds: 60);
+  static const int kDefaultMaxMinutes = 30;
+  static const int kMaxMinutesCeil = 240;
+
   bool _lastActive = false;
   bool _disposed = false;
+
+  // 🟢 REVISI: re-subscribe
+  Timer? _resubTimer;
+  Duration _backoff = kResubscribeMin;
+
+  // 🟢 REVISI: ping viewer opsional (timer sekali-jalan yang di-reset tiap
+  // ping, bukan polling).
+  Timer? _pingTimer;
+  bool _pingSeen = false;
+  bool _pingFresh = false;
+
+  // 🟢 REVISI: batas durasi kirim
+  int _maxMinutes;
+  DateTime? _activeSince;
+  bool _capped = false;
 
   LiveCamService({
     required this.channelName,
     required this.onWatchersChanged,
     this.onLog,
-  });
+    int maxMinutes = kDefaultMaxMinutes,
+  }) : _maxMinutes = _clampMax(maxMinutes);
+
+  static int _clampMax(int v) => v.clamp(0, kMaxMinutesCeil).toInt();
+
+  /// Batas menit kirim frame berkelanjutan (0 = tanpa batas). Boleh diubah
+  /// kapan saja (mis. dari calib.live_cam_max_min).
+  int get maxMinutes => _maxMinutes;
+  set maxMinutes(int v) {
+    final c = _clampMax(v);
+    if (c == _maxMinutes) return;
+    _maxMinutes = c;
+    // Batas dilonggarkan saat sedang tertahan: hitung ulang.
+    if (_capped && (c == 0 || !_isOverLimit())) {
+      _capped = false;
+      _recompute();
+    }
+  }
+
+  /// true = frame sedang ditahan karena batas durasi tercapai.
+  bool get isCapped => _capped;
+
+  bool _isOverLimit() {
+    final since = _activeSince;
+    if (_maxMinutes <= 0 || since == null) return false;
+    return DateTime.now().difference(since) >= Duration(minutes: _maxMinutes);
+  }
 
   void start() {
     if (_channel != null) return; // sudah jalan
-    _channel = _client.channel(channelName);
-    _channel!
-      ..onPresenceSync((_) => _handlePresenceChange())
-      ..onPresenceJoin((_) => _handlePresenceChange())
-      ..onPresenceLeave((_) => _handlePresenceChange())
-      ..subscribe((status, error) {
-        if (status == RealtimeSubscribeStatus.subscribed) {
-          onLog?.call(
-            LogDirection.info,
-            'CAM',
-            'Channel live-cam siap ($channelName)',
-          );
-        } else if (error != null) {
-          onLog?.call(
-            LogDirection.error,
-            'CAM',
-            'Channel live-cam error: $error',
-          );
-        }
-      });
+    _createChannel();
   }
 
-  void _handlePresenceChange() {
+  void _createChannel() {
+    final ch = _client.channel(channelName);
+    _channel = ch;
+    ch
+      ..onPresenceSync((_) {
+        if (identical(_channel, ch)) _recompute();
+      })
+      ..onPresenceJoin((_) {
+        if (identical(_channel, ch)) _recompute(join: true);
+      })
+      ..onPresenceLeave((_) {
+        if (identical(_channel, ch)) _recompute();
+      })
+      // TODO verifikasi: signature onBroadcast di supabase_flutter ^2.17.2
+      // (event: String, callback: void Function(Map<String, dynamic>)).
+      ..onBroadcast(
+        event: 'ping',
+        callback: (_) {
+          if (identical(_channel, ch)) _onPing();
+        },
+      )
+      ..subscribe((status, error) => _onStatus(ch, status, error));
+  }
+
+  void _onStatus(
+    RealtimeChannel ch,
+    RealtimeSubscribeStatus status,
+    Object? error,
+  ) {
+    if (_disposed || !identical(_channel, ch)) return;
+    if (status == RealtimeSubscribeStatus.subscribed) {
+      _backoff = kResubscribeMin;
+      _resubTimer?.cancel();
+      _resubTimer = null;
+      onLog?.call(
+        LogDirection.info,
+        'CAM',
+        'Channel live-cam siap ($channelName)',
+      );
+      // Presence dihitung ulang setiap (re)subscribe.
+      _recompute();
+      return;
+    }
+    if (status == RealtimeSubscribeStatus.closed ||
+        status == RealtimeSubscribeStatus.timedOut ||
+        status == RealtimeSubscribeStatus.channelError) {
+      onLog?.call(
+        LogDirection.error,
+        'CAM',
+        'Channel live-cam $status${error != null ? ' ($error)' : ''}',
+      );
+      _scheduleResubscribe();
+    } else if (error != null) {
+      onLog?.call(LogDirection.error, 'CAM', 'Channel live-cam error: $error');
+    }
+  }
+
+  void _scheduleResubscribe() {
+    if (_disposed || _resubTimer != null) return;
+    final delay = _backoff;
+    _backoff = Duration(
+      seconds: math.min(delay.inSeconds * 2, kResubscribeMax.inSeconds),
+    );
+    onLog?.call(
+      LogDirection.info,
+      'CAM',
+      'Live-cam subscribe ulang dalam ${delay.inSeconds} dtk',
+    );
+    _resubTimer = Timer(delay, () async {
+      _resubTimer = null;
+      if (_disposed) return;
+      final old = _channel;
+      _channel = null; // callback channel lama jadi stale (diabaikan)
+      if (old != null) {
+        try {
+          await _client.removeChannel(old);
+        } catch (_) {}
+      }
+      if (_disposed) return;
+      _createChannel();
+    });
+  }
+
+  void _onPing() {
+    if (_disposed) return;
+    _pingSeen = true;
+    _pingFresh = true;
+    _pingTimer?.cancel();
+    _pingTimer = Timer(kPingTimeout, () {
+      if (_disposed) return;
+      _pingFresh = false;
+      onLog?.call(
+        LogDirection.info,
+        'CAM',
+        'Viewer live-cam 60 dtk tanpa ping -> dianggap hilang',
+      );
+      _recompute();
+    });
+    _recompute(); // pulih bila sebelumnya dianggap hilang
+  }
+
+  void _resetPing() {
+    _pingTimer?.cancel();
+    _pingTimer = null;
+    _pingSeen = false;
+    _pingFresh = false;
+  }
+
+  void _recompute({bool join = false}) {
     if (_disposed) return;
     // presenceState() balikin Map/List tergantung versi supabase_flutter --
     // isNotEmpty ada di keduanya, jadi ini aman lintas versi.
     final state = _channel?.presenceState();
-    final active = state != null && state.isNotEmpty;
+    final present = state != null && state.isNotEmpty;
+
+    if (!present) {
+      _resetPing();
+      _capped = false;
+    }
+    if (join) {
+      // Viewer baru: ping lama tidak berlaku (viewer lama bisa tanpa ping)
+      // dan batas durasi dimulai lagi.
+      _resetPing();
+      if (present) {
+        _capped = false;
+        _activeSince = DateTime.now();
+      }
+    }
+
+    final active = present && (!_pingSeen || _pingFresh) && !_capped;
     if (active == _lastActive) return; // no-op kalau memang gak berubah
     _lastActive = active;
+    if (active) {
+      _activeSince ??= DateTime.now();
+    } else if (!_capped) {
+      _activeSince = null;
+    }
     onLog?.call(
       LogDirection.info,
       'CAM',
@@ -94,6 +267,20 @@ class LiveCamService {
   /// Kirim 1 frame JPEG (bytes SUDAH terenkode) ke semua viewer nyambung.
   /// Fire-and-forget dari sisi caller.
   Future<void> sendFrame(Uint8List jpegBytes) async {
+    // 🟢 REVISI: batas durasi kirim berkelanjutan.
+    if (_capped) return;
+    if (_isOverLimit()) {
+      _capped = true;
+      onLog?.call(
+        LogDirection.info,
+        'CAM',
+        'Batas live-cam $_maxMinutes menit tercapai -> berhenti kirim frame '
+        '(buka ulang panel untuk lanjut)',
+      );
+      _recompute(); // -> active=false -> onWatchersChanged(false)
+      return;
+    }
+
     final channel = _channel;
     // 🟢 FIX DIAGNOSTIK: sebelumnya branch ini `return` TOTAL DIAM --
     // kalau start() belum sempat dipanggil / channel sempat null karena
@@ -145,6 +332,10 @@ class LiveCamService {
 
   void dispose() {
     _disposed = true;
+    _resubTimer?.cancel();
+    _resubTimer = null;
+    _pingTimer?.cancel();
+    _pingTimer = null;
     final channel = _channel;
     _channel = null;
     if (channel != null) _client.removeChannel(channel);
