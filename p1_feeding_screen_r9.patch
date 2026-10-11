@@ -1,0 +1,148 @@
+--- a/lib/feeding_screen.dart
++++ b/lib/feeding_screen.dart
+@@ -20,6 +20,7 @@
+ import 'dev_log.dart';
+ import 'live_cam_service.dart';
+ import 'camera_manager.dart'; // 🟢 REVISI (P1): pemilik tunggal CameraController
++import 'safe_restart.dart'; // 🟢 REVISI (P1/R9): restart app aman saat idle
+ 
+ /// CATATAN REVISI ARSITEKTUR & FITUR (lihat instruksi user untuk detail):
+ /// 1. Mode Normal/Dev (SegmentedButton) -- panel Dev nampilin log traffic
+@@ -94,6 +95,11 @@
+   late DevLogBuffer _devLog;
+   late LiveCamService _liveCam;
+ 
++  // 🟢 REVISI (P1/R9 / SPEC 3.6): restart app hanya saat idle. Tanpa timer
++  // baru: scheduler dipanggil dari tick _resourceTimer (10 dtk).
++  late final SafeRestartScheduler _restart;
++  int _cfgPushing = 0; // >0 = _pushFullConfigToEsp sedang berjalan
++
+   bool _isDevMode = false;
+   bool _isFeeding = false;
+   bool _isAiTestMode = false;
+@@ -348,6 +354,7 @@
+         // 🟢 REVISI: begitu link tersambung, tulis bt_connected=true SEKALI
+         // (sebelumnya hanya false yang ditulis; true menunggu telemetri).
+         if (connected) _pushBtStatus(true);
++        if (connected) _restart.markBtConnected(); // 🟢 REVISI (P1/R9)
+         // 🟢 FIX: begitu link putus, tidak akan ada paket telemetri
+         // berikutnya yang bisa "membawa" status bt_connected ke Supabase --
+         // jadi tulis langsung SEKALI di sini (bukan timer/heartbeat
+@@ -383,6 +390,23 @@
+     );
+     _liveCam.start();
+ 
++    // 🟢 REVISI (P1/R9 / SPEC 3.6): dibuat sebelum BT/resource timer jalan.
++    _restart = SafeRestartScheduler(
++      isIdle: _isRestartIdle,
++      getCfg: () => _lastCfg,
++      restartRecommended: () => _cam.restartRecommended,
++      clearRestartRecommended: _cam.clearRestartRecommended,
++      // Torch self-test meniru sesi: hanya bila flash_auto_session aktif.
++      selfTest: (d) =>
++          _cam.selfTest(d, useTorch: widget.config.flashAutoSession),
++      onLog: (m, {bool error = false}) => _devLog.add(
++        error ? LogDirection.error : LogDirection.info,
++        'RESTART',
++        m,
++      ),
++    );
++    _restart.init(); // fire-and-forget: tandai "app mulai" bila hasil restart
++
+     // CPU gak boleh tidur -- comms BT & Supabase harus tetap jalan walau
+     // layar gelap/hemat daya. Sengaja TIDAK pernah di-disable.
+     WakelockPlus.enable();
+@@ -941,6 +965,16 @@
+   /// Kirim ulang SELURUH cfg terakhir ke ESP (dipakai saat link BT baru
+   /// tersambung, karena ESP kemungkinan besar baru saja restart).
+   Future<void> _pushFullConfigToEsp() async {
++    // 🟢 REVISI (P1/R9): penanda "push cfg sedang berjalan" untuk syarat idle.
++    _cfgPushing++;
++    try {
++      await _pushFullConfigToEspImpl();
++    } finally {
++      _cfgPushing--;
++    }
++  }
++
++  Future<void> _pushFullConfigToEspImpl() async {
+     var cfg = _lastCfg;
+     Map<String, dynamic>? fetchedRow; // 🟢 REVISI: hindari fetch ganda
+     if (cfg.isEmpty) {
+@@ -967,6 +1001,7 @@
+       if (_desiredAutoMode != null) 'auto_mode': _desiredAutoMode,
+     };
+     await _btService.sendConfig(payload);
++    _restart.markCfgSent(); // 🟢 REVISI (P1/R9): ukur durasi restart
+     // Jaga dedup _onRemoteConfigChanged tetap konsisten dengan yang terkirim.
+     if (_desiredAutoMode != null) _lastAutoMode = _desiredAutoMode;
+     _devLog.add(
+@@ -1359,6 +1394,8 @@
+           _pushFlashOff();
+         }
+       }
++      // 🟢 REVISI (P1/R9 / SPEC 3.6): evaluasi restart aman (numpang tick ini).
++      _restart.tick();
+       try {
+         final tempFile = File('/sys/class/thermal/thermal_zone0/temp');
+         if (await tempFile.exists()) {
+@@ -1407,6 +1444,35 @@
+     return _cam.apply(_needsCamera, _needsStream, _flashOn);
+   }
+ 
++  /// 🟢 REVISI (P1/R9 / SPEC 3.6): true = SEMUA idle -> aman restart app.
++  /// Tidak feeding/tail/uji coba/live-cam/flash/preview, rantai upload kosong,
++  /// push cfg selesai (jadwal pakan dinilai di SafeRestartScheduler).
++  Future<bool> _isRestartIdle() async {
++    if (_disposing || !mounted) return false;
++    if (_isFeeding || _isTailRecording || _isAiTestMode || _isLiveCamActive) {
++      return false;
++    }
++    if (_sessionStarting || _cameraForcedOn || _flashOn) return false;
++    if (_cam.isCameraActive || _cam.torchActual) return false;
++    if (_cfgPushing > 0) return false;
++    if (_diagTimer != null || _diagBusy || _diagBacklog.isNotEmpty) {
++      return false;
++    }
++    final phase = _lastTelemetry?.feeder.msg;
++    if (_isBtConnected &&
++        phase != null &&
++        const {'PREP AI', 'DISPENSE', 'WAIT AI'}.contains(phase)) {
++      return false;
++    }
++    // Rantai upload kosong: future yang sudah selesai menjalankan callback-nya
++    // dalam satu putaran microtask.
++    var uploadDone = false;
++    _uploadChain.then((_) => uploadDone = true, onError: (_) => uploadDone = true);
++    await Future<void>.microtask(() {});
++    await Future<void>.microtask(() {});
++    return uploadDone && !_disposing;
++  }
++
+   /// Event kamera -> recorder (ai_diag_log). Hanya saat ada rekaman sesi
+   /// (atau sesi sedang dimulai) supaya buffer recorder tidak menumpuk di luar sesi.
+   void _camEvent(String name, Map<String, dynamic>? data) {
+@@ -2474,6 +2540,7 @@
+       // sudah dijaga `mounted`, jadi aman dipanggil di sini.
+       _endTail('dispose');
+     }
++    _restart.dispose(); // 🟢 REVISI (P1/R9)
+     _cam.disposeAll(); // 🟢 REVISI (P1): tanpa await; manager menutup kamera tuntas
+     _liveCam.dispose();
+     _supabase.dispose();
+@@ -2632,6 +2699,7 @@
+               'HP',
+               'Mode Dev aktif (auto-dark dimatikan, layar tetap terang)',
+             );
++            _restart.logSummary(); // 🟢 REVISI (P1/R9): log hanya saat Dev
+           } else {
+             // Balik ke Normal: pasang lagi timer auto-dark.
+             _onUserActivity(force: true);
+@@ -2982,6 +3050,7 @@
+         row('CPU J2', _cpuText),
+         row('Suhu HP J2', _tempText),
+         row('Status BT', _isBtConnected ? 'Terhubung' : 'Terputus'),
++        row('Restart app (R9)', _restart.summary),
+       ],
+     );
+   }
