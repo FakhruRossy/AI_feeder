@@ -104,6 +104,116 @@ class FeederSupabaseService {
   }
 
   // ---------------------------------------------------------------------
+  // 🟢 REVISI (P1 / SPEC 3.2, 3.3, 3.5, 4): kamera & flash J2 stabil.
+  // Semua method di bawah HANYA menulis saat ada perubahan (tidak berkala),
+  // dan yang bersyarat memakai filter .eq/.not supaya 0 baris cocok = tidak
+  // ada tulisan sama sekali (tidak menimpa nilai yang lebih baru).
+  // ---------------------------------------------------------------------
+
+  /// device_config.flash_on = false HANYA bila masih true (J2 yang mematikan:
+  /// timeout / viewer hilang / app start). true = berhasil (termasuk 0 baris
+  /// cocok); false = error jaringan/DB -> pemanggil mengulang.
+  Future<bool> setFlashOffIfOn() async {
+    try {
+      await _client
+          .from(configTable)
+          .update({
+            'flash_on': false,
+            'updated_at': DateTime.now().toIso8601String(),
+          })
+          .eq('id', rowId)
+          .eq('flash_on', true);
+      return true;
+    } catch (e) {
+      onLog?.call(LogDirection.error, 'SUPA', 'Gagal tulis flash_on=false: $e');
+      return false;
+    }
+  }
+
+  /// feeder_status.flash_actual = status torch SEBENARNYA. Dipanggil HANYA saat
+  /// torchActual berubah. (Kolom baru di feeder_status, bukan device_telemetry:
+  /// tabel itu punya trigger history di setiap UPDATE.)
+  Future<void> setFlashActual(bool actual) async {
+    try {
+      await _client
+          .from(feedSessionTable)
+          .update({'flash_actual': actual})
+          .eq('id', rowId);
+    } catch (e) {
+      onLog?.call(LogDirection.error, 'SUPA', 'Gagal tulis flash_actual: $e');
+    }
+  }
+
+  /// Koreksi flash_actual basi saat app start (app mati saat torch nyala):
+  /// tulis false HANYA bila masih true.
+  Future<void> resetFlashActualIfOn() async {
+    try {
+      await _client
+          .from(feedSessionTable)
+          .update({'flash_actual': false})
+          .eq('id', rowId)
+          .eq('flash_actual', true);
+    } catch (e) {
+      onLog?.call(LogDirection.error, 'SUPA', 'Gagal reset flash_actual: $e');
+    }
+  }
+
+  /// feeder_status.cam_issue (+ cam_issue_at): black | stall | init_failed.
+  /// Pemanggil menjamin sekali per jenis per sesi.
+  Future<void> setCamIssue(String kind, DateTime at) async {
+    try {
+      await _client
+          .from(feedSessionTable)
+          .update({
+            'cam_issue': kind,
+            'cam_issue_at': at.toUtc().toIso8601String(),
+          })
+          .eq('id', rowId);
+    } catch (e) {
+      onLog?.call(LogDirection.error, 'SUPA', 'Gagal tulis cam_issue: $e');
+    }
+  }
+
+  /// Reset cam_issue/cam_issue_at ke null saat sesi baru mulai -- HANYA bila
+  /// cam_issue sebelumnya tidak null (filter di sisi DB, tanpa baca dulu).
+  // TODO verifikasi: .not('cam_issue', 'is', null) di postgrest ^2.x
+  // (harus menghasilkan cam_issue=not.is.null).
+  Future<void> clearCamIssueIfSet() async {
+    try {
+      await _client
+          .from(feedSessionTable)
+          .update({'cam_issue': null, 'cam_issue_at': null})
+          .eq('id', rowId)
+          .not('cam_issue', 'is', null);
+    } catch (e) {
+      onLog?.call(LogDirection.error, 'SUPA', 'Gagal reset cam_issue: $e');
+    }
+  }
+
+  /// Saat app start: state 'feeding' yang nyangkut (app mati saat sesi) ->
+  /// 'stopped'/'app_restart' HANYA bila state saat ini 'feeding'. 'stopped'
+  /// dengan alasan asli TIDAK ditimpa.
+  Future<void> closeStaleFeeding() async {
+    try {
+      await _client
+          .from(feedSessionTable)
+          .update({
+            'state': 'stopped',
+            'last_stop_reason': 'app_restart',
+            'updated_at': DateTime.now().toIso8601String(),
+          })
+          .eq('id', rowId)
+          .eq('state', 'feeding');
+    } catch (e) {
+      onLog?.call(
+        LogDirection.error,
+        'SUPA',
+        'Gagal koreksi feeder_status saat start: $e',
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------
   // 🟢 FIX BUG "override pompa/charger stuck di 1" (item 1)
   // ---------------------------------------------------------------------
 

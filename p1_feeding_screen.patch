@@ -1,0 +1,946 @@
+--- a/lib/feeding_screen.dart
++++ b/lib/feeding_screen.dart
+@@ -19,6 +19,7 @@
+ import 'telemetry_packet.dart';
+ import 'dev_log.dart';
+ import 'live_cam_service.dart';
++import 'camera_manager.dart'; // 🟢 REVISI (P1): pemilik tunggal CameraController
+ 
+ /// CATATAN REVISI ARSITEKTUR & FITUR (lihat instruksi user untuk detail):
+ /// 1. Mode Normal/Dev (SegmentedButton) -- panel Dev nampilin log traffic
+@@ -65,7 +66,8 @@
+ 
+ class _FeedingScreenState extends State<FeedingScreen>
+     with WidgetsBindingObserver {
+-  CameraController? _controller;
++  // 🟢 REVISI (P1): CameraController dimiliki CameraManager (_cam), bukan layar ini.
++  late final CameraManager _cam;
+   final _extractor = MotionEnergyExtractor();
+   FeederTriggerAdaptive? _trigger;
+ 
+@@ -115,24 +117,22 @@
+   bool _cameraForcedOn = false;
+ 
+   // ---------------------------------------------------------------------
+-  // KAMERA: status antrean, watchdog, proteksi frame hitam
++  // KAMERA (🟢 REVISI P1): antrean/watchdog/restart lama dipindah ke
++  // CameraManager. Di sini tinggal jembatan sesi + penanda dispose.
+   // ---------------------------------------------------------------------
+-  Future<void> _camOps = Future<void>.value(); // antrean tunggal init/dispose
+-  bool _reconcileQueued = false;
+   bool _sessionStarting = false; // jembatan antar _endTail -> _startFeeding
+   bool _disposing = false;
+-  DateTime? _camLastDisposeAt;
+-  DateTime? _lastFrameAt;
+-  DateTime? _streamStartedAt;
+-  DateTime? _blackSince;
+-  int _blackFrames = 0;
+-  bool get _camBlackConfirmed => _blackFrames >= 5;
+-  Timer? _camWatchdog;
+-  bool _camRestarting = false;
+-  int _camRestartAttempts = 0;
+-  DateTime? _camLastRestartAt;
+-  DateTime? _camGiveUpUntil;
+-  static const int _camMaxRestarts = 3;
++
++  // 🟢 REVISI (P1 / SPEC 3.3): bookkeeping flash MANUAL. Tanpa timer baru:
++  // timeout dicek di tick _resourceTimer (10 dtk) yang sudah ada.
++  DateTime? _flashManualSince; // kapan flash manual mulai / terakhir di-renew
++  bool _flashViewerSeen = false; // ada viewer live-cam selagi flash manual nyala
++  bool _flashOffDirty = false; // tulis flash_on=false ke DB gagal -> ulangi
++  int _lastFlashRenew = 0; // dedup calib.flash_renew (seq naik)
++  // 🟢 REVISI (P1 / SPEC 3.2): jenis masalah kamera yang SUDAH ditulis ke
++  // feeder_status pada sesi ini (sekali per jenis per sesi).
++  final Set<String> _camIssueReported = <String>{};
++
+   Timer? _liveCamOffTimer;
+   bool _btStatusDirty = false;
+   bool _btStatusLast = false;
+@@ -300,8 +300,11 @@
+   DateTime? _lastActivityAt;
+   static const Duration _activityThrottle = Duration(milliseconds: 400);
+ 
+-  bool get _isCameraActive =>
+-      _controller != null && _controller!.value.isInitialized;
++  bool get _isCameraActive => _cam.isCameraActive; // 🟢 REVISI (P1)
++
++  /// 🟢 REVISI (P1): untuk Room 9 (SafeRestartScheduler). true = watchdog
++  /// kamera mendeteksi black/stall/init_failed; restart app dijadwalkan saat idle.
++  bool get restartRecommended => _cam.restartRecommended;
+ 
+   Duration get _minFrameInterval =>
+       Duration(milliseconds: (1000 / widget.config.processingFps).round());
+@@ -354,12 +357,27 @@
+       onLog: _devLog.add,
+     );
+ 
++    // 🟢 REVISI (P1): CameraManager dibuat setelah _devLog & _recorder siap.
++    _cam = CameraManager(
++      backend: const RealCameraBackend(),
++      onImage: _onFrame,
++      onLog: _devLog.add,
++      onEvent: _camEvent,
++      onTorchChanged: _onTorchActualChanged,
++      onIssue: _onCamIssue,
++      // onRecovered sengaja kosong: manager sudah mencatat 'cam_ok' + log.
++      onStateChanged: () {
++        if (mounted && !_disposing) setState(() {});
++      },
++    );
++
+     // Nama channel disatukan sama rowId perangkat -- kalau suatu saat ada
+     // >1 unit J2, tiap unit punya channel live-cam sendiri, gak nabrak.
+     _liveCam = LiveCamService(
+       channelName: 'livecam:$rowId',
+       onWatchersChanged: _onLiveCamWatchersChanged,
+       onLog: _devLog.add,
++      maxMinutes: widget.config.liveCamMaxMinutes, // 🟢 REVISI (P1 / SPEC 3.4)
+     );
+     _liveCam.start();
+ 
+@@ -802,22 +820,20 @@
+     _adoptBaseline(row);
+     // Torch fisik pasti mati saat app baru start -> samakan kolom flash_on
+     // (kalau tidak, event config pertama akan menyalakan flash tanpa diminta).
+-    if (row['flash_on'] == true && !_flashOn) _supabase.setFlashOn(false);
++    // 🟢 REVISI (P1 / SPEC 3.3): bersyarat (eq flash_on=true) + diulang oleh
++    // tick resource bila gagal. flash_actual basi (app mati saat torch nyala)
++    // juga dikoreksi sekali, bersyarat -- tidak menulis apa pun bila sudah false.
++    if (row['flash_on'] == true && !_flashOn) _pushFlashOff();
++    _supabase.resetFlashActualIfOn();
+     if (_isBtConnected) await _pushFullConfigToEsp();
+     // 🟢 REVISI: state 'feeding' yang nyangkut (app mati saat sesi) dikoreksi
+     // ke 'stopped'. Cek ULANG setelah await di atas: jangan timpa kalau
+     // sesi/uji coba AI sudah aktif (termasuk uji coba yang dilanjut dari
+     // baseline remote lewat _adoptBaseline -> _startAiTest).
++    // 🟢 REVISI (P1 / SPEC 3.5): update BERSYARAT eq('state','feeding') --
++    // 'stopped' dengan alasan asli TIDAK ditimpa 'app_restart'.
+     if (!_isFeeding && !_isAiTestMode) {
+-      _supabase
+-          .updateFeedingStatus(state: 'stopped', stopReason: 'app_restart')
+-          .catchError((e) {
+-            _devLog.add(
+-              LogDirection.error,
+-              'SUPA',
+-              'Gagal koreksi feeder_status saat start: $e',
+-            );
+-          });
++      _supabase.closeStaleFeeding();
+     }
+   }
+ 
+@@ -855,6 +871,9 @@
+       // supaya seq lama yang nyangkut di DB tidak membatalkan tail baru.
+       final tc = calibMap['tail_cancel'];
+       if (tc is num) _lastTailCancelSeq = tc.toInt();
++      // 🟢 REVISI (P1): seed dedup flash_renew (nilai lama bukan perintah baru).
++      final fr = calibMap['flash_renew'];
++      if (fr is num) _lastFlashRenew = fr.toInt();
+       _applyCalib(calibMap);
+     }
+ 
+@@ -1118,7 +1137,11 @@
+     }
+ 
+     final flashOn = row['flash_on'];
+-    if (flashOn is bool && flashOn != _flashOn) _applyFlash(flashOn);
++    // 🟢 REVISI (P1): dari web -> TIDAK ditulis balik (DB sudah berisi nilai
++    // ini; tulis balik bisa menimpa klik web yang lebih baru).
++    if (flashOn is bool && flashOn != _flashOn) {
++      _applyFlash(flashOn, fromWeb: true);
++    }
+ 
+     _handleRemoteLabel(row['label_cmd']);
+ 
+@@ -1257,6 +1280,31 @@
+       (v) => cfgObj.tailRecordSeconds = FeederConfig.clampTail(v),
+     );
+ 
++    // 🟢 REVISI (P1 / SPEC 4): kunci opsional flash & live-cam. SENGAJA tidak
++    // lewat applyD/applyI: tidak disimpan ke prefs dan _calibVersion TIDAK
++    // dinaikkan. Key tidak ada = default J2 (webapp lama aman).
++    final ft = c['flash_timeout_s'];
++    cfgObj.flashTimeoutSeconds = FeederConfig.clampFlashTimeout(
++      ft is num ? ft.toDouble() : FeederConfig.flashTimeoutDefault,
++    );
++    cfgObj.flashAutoSession = c['flash_auto_session'] == true;
++    final lm = c['live_cam_max_min'];
++    final lmClamped = FeederConfig.clampLiveCamMaxMin(
++      lm is num ? lm.toInt() : FeederConfig.liveCamMaxMinDefault,
++    );
++    cfgObj.liveCamMaxMinutes = lmClamped;
++    _liveCam.maxMinutes = lmClamped;
++    // flash_renew (seq naik): reset timer flash manual bila lebih besar dari
++    // yang terakhir dilihat.
++    final fr = c['flash_renew'];
++    if (fr is num && fr.toInt() > _lastFlashRenew) {
++      _lastFlashRenew = fr.toInt();
++      if (_flashManual) {
++        _flashManualSince = DateTime.now();
++        _devLog.add(LogDirection.info, 'HP', 'Timer flash di-renew dari webapp');
++      }
++    }
++
+     if (!changed) return;
+ 
+     cfgObj.save();
+@@ -1295,6 +1343,16 @@
+     _resourceTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+       if (!mounted) return;
+       if (_btStatusDirty) _pushBtStatus(_btStatusLast);
++      // 🟢 REVISI (P1 / SPEC 3.3): timeout flash manual + ulang tulis
++      // flash_on=false yang gagal. Numpang tick yang sudah ada (tanpa timer baru).
++      _checkFlashTimeout();
++      if (_flashOffDirty) {
++        if (_flashOn) {
++          _flashOffDirty = false; // flash menyala lagi: tidak relevan
++        } else {
++          _pushFlashOff();
++        }
++      }
+       try {
+         final tempFile = File('/sys/class/thermal/thermal_zone0/temp');
+         if (await tempFile.exists()) {
+@@ -1318,185 +1376,80 @@
+   }
+ 
+   // ---------------------------------------------------------------------
+-  // KAMERA: hanya nyala saat dibutuhkan, dispose total saat idle
++  // KAMERA (🟢 REVISI P1 / Room 5): SEMUA buka/tutup/torch/stream/lock lewat
++  // CameraManager (lib/camera_manager.dart). Layar ini HANYA menghitung
++  // kebutuhan dari flag yang ada lalu memanggil _reconcileCameraState() ->
++  // _cam.apply(...). Antrean, watchdog 2 dtk, dan restart kamera otomatis
++  // yang dulu ada di sini DIHAPUS: bukti lapangan -- tutup-buka kamera tidak
++  // pernah memulihkan layar hitam (SPEC 2). Watchdog di manager hanya
++  // DETEKSI + CATAT; pemulihan = restart app terjadwal saat idle (Room 9).
+   // ---------------------------------------------------------------------
+ 
+-  // ---------------------------------------------------------------------
+-  // KAMERA: SEMUA buka/tutup lewat SATU antrean (_enqueueCam)
+-  //
+-  // AKAR BUG "kamera hitam penuh sesudah sesi pakan" (versi lama):
+-  //  1) _initCamera() baru mengisi _controller SESUDAH initialize() selesai,
+-  //     jadi dua pemanggil bersamaan (mis. _startFeeding + presence live-cam
+-  //     + flash) sama-sama lolos guard dan membuat DUA CameraController. Yang
+-  //     kedua menimpa referensi pertama, yang pertama TIDAK PERNAH di-dispose
+-  //     -> handle kamera bocor -> HAL memberi frame hitam sampai proses mati.
+-  //  2) Kalau initialize() melempar error, controller yang sudah dibuat tidak
+-  //     di-dispose (bocor juga).
+-  //  3) _disposeCameraHardware() meng-null-kan _controller LEBIH DULU lalu
+-  //     menunggu stop/dispose tanpa di-await oleh pemanggil -> init berikutnya
+-  //     membuka kamera selagi yang lama masih menutup.
+-  //  4) Tidak ada penanganan lifecycle (app ke background) dan tidak ada
+-  //     deteksi frame hitam/tidak ada frame, jadi kondisi rusak bertahan.
+-  // Sekarang: operasi diserialkan, controller gagal selalu di-dispose, ada
+-  // jeda lepas HAL, watchdog + restart otomatis, dan hysteresis live-cam.
+-  // ---------------------------------------------------------------------
+-
+-  Future<T> _enqueueCam<T>(Future<T> Function() op) {
+-    final completer = Completer<T>();
+-    _camOps = _camOps.then((_) async {
+-      try {
+-        completer.complete(await op());
+-      } catch (e, st) {
+-        completer.completeError(e, st);
+-      }
+-    });
+-    return completer.future;
+-  }
++  /// Image stream harus jalan (persis logika _ensureImageStreamState lama).
++  bool get _needsStream =>
++      _isFeeding || _isTailRecording || _isAiTestMode || _isLiveCamActive;
+ 
++  /// Kamera harus terbuka. Preview manual / flash-saja = terbuka tanpa stream.
+   bool get _needsCamera =>
+-      _isFeeding ||
+-      _isTailRecording ||
+-      _sessionStarting ||
+-      _cameraForcedOn ||
+-      _isAiTestMode ||
+-      _isLiveCamActive ||
+-      _flashOn;
+-
+-  Future<void> _initCamera() => _enqueueCam(_initCameraImpl);
+-
+-  Future<void> _disposeCameraHardware() => _enqueueCam(_disposeCameraImpl);
+-
+-  Future<void> _ensureImageStreamState() => _enqueueCam(_ensureStreamImpl);
+-
+-  Future<void> _initCameraImpl() async {
+-    if (_controller != null) return; // idempoten
+-    // Beri waktu HAL melepas kamera setelah dispose terakhir.
+-    final last = _camLastDisposeAt;
+-    if (last != null) {
+-      final wait =
+-          const Duration(milliseconds: 800) - DateTime.now().difference(last);
+-      if (wait > Duration.zero) await Future.delayed(wait);
+-    }
+-    CameraController? pending;
+-    try {
+-      final cameras = await availableCameras();
+-      final cam = cameras.firstWhere(
+-        (c) => c.lensDirection == CameraLensDirection.back,
+-        orElse: () => cameras.first,
+-      );
+-      pending = CameraController(
+-        cam,
+-        ResolutionPreset.medium,
+-        enableAudio: false,
+-        imageFormatGroup: ImageFormatGroup.yuv420,
+-      );
+-      await pending.initialize();
+-      if (_disposing || !mounted) {
+-        await pending.dispose();
+-        pending = null;
+-        return;
+-      }
+-      final ready = pending;
+-      pending = null; // kepemilikan pindah ke _controller
+-      _controller = ready;
+-      _lastFrameAt = null;
+-      _streamStartedAt = null;
+-      _blackFrames = 0;
+-      _blackSince = null;
+-      if (mounted) setState(() {});
+-      _devLog.add(LogDirection.info, 'HP', 'Kamera dinyalakan');
+-      if (_flashOn) {
+-        try {
+-          await ready.setFlashMode(FlashMode.torch);
+-        } catch (e) {
+-          _devLog.add(LogDirection.error, 'HP', 'Gagal nyalakan torch: $e');
+-        }
+-      }
+-      _startCamWatchdog();
+-    } catch (e) {
+-      _devLog.add(LogDirection.error, 'HP', 'Gagal nyalain kamera: $e');
+-      final leaked = pending;
+-      if (leaked != null) {
+-        // JANGAN bocorkan handle kamera kalau initialize() gagal.
+-        try {
+-          await leaked.dispose();
+-        } catch (_) {}
+-        _camLastDisposeAt = DateTime.now();
+-      }
+-    }
++      _needsStream || _sessionStarting || _cameraForcedOn || _flashOn;
++
++  /// 🟢 REVISI (P1): SATU titik pusat. Idempotent; panggilan bertumpuk
++  /// digabung di CameraManager (yang dieksekusi = kebutuhan TERBARU).
++  /// Future selesai saat kebutuhan terbaru terpenuhi (tidak melempar).
++  Future<void> _reconcileCameraState() {
++    if (_disposing) return Future<void>.value();
++    return _cam.apply(_needsCamera, _needsStream, _flashOn);
+   }
+ 
+-  Future<void> _disposeCameraImpl() async {
+-    final controller = _controller;
+-    if (controller == null) return;
+-    _controller = null;
+-    _stopCamWatchdog();
+-    if (mounted && !_disposing) setState(() {});
+-    try {
+-      if (controller.value.isStreamingImages) {
+-        await controller.stopImageStream();
+-      }
+-    } catch (_) {}
+-    try {
+-      await controller.dispose();
+-      _devLog.add(
+-        LogDirection.info,
+-        'HP',
+-        'Kamera dimatikan total (idle, hemat panas)',
+-      );
+-    } catch (e) {
+-      _devLog.add(LogDirection.error, 'HP', 'Gagal matiin kamera: $e');
+-    }
+-    _camLastDisposeAt = DateTime.now();
+-    // Jeda lepas HAL sebelum operasi berikutnya di antrean boleh membuka lagi.
+-    await Future.delayed(const Duration(milliseconds: 600));
+-  }
+-
+-  /// Panggil setelah _isFeeding/_cameraForcedOn/_isAiTestMode/
+-  /// _isLiveCamActive/_flashOn berubah. Dikoalesi + dievaluasi ULANG saat
+-  /// gilirannya di antrean (bukan saat dipanggil), supaya keputusan selalu
+-  /// memakai kebutuhan TERBARU.
+-  void _reconcileCameraState() {
+-    if (_reconcileQueued) return;
+-    _reconcileQueued = true;
+-    _enqueueCam(() async {
+-      _reconcileQueued = false;
+-      if (_needsCamera && _controller == null) {
+-        await _initCameraImpl();
+-      } else if (!_needsCamera && _controller != null) {
+-        await _disposeCameraImpl();
+-      }
+-      await _ensureStreamImpl();
+-      await _applyTorchImpl();
+-    }).catchError((_) {});
+-  }
+-
+-  Future<void> _applyTorchImpl() async {
+-    final c = _controller;
+-    if (c == null || !c.value.isInitialized) return;
+-    final target = _flashOn ? FlashMode.torch : FlashMode.off;
+-    if (c.value.flashMode == target) return;
+-    try {
+-      await c.setFlashMode(target);
+-    } catch (e) {
+-      _devLog.add(LogDirection.error, 'HP', 'Gagal atur flash: $e');
+-    }
++  /// Event kamera -> recorder (ai_diag_log). Hanya saat ada rekaman sesi
++  /// (atau sesi sedang dimulai) supaya buffer recorder tidak menumpuk di luar sesi.
++  void _camEvent(String name, Map<String, dynamic>? data) {
++    if (_diagTimer == null && !_sessionStarting) return;
++    _recorder.addEvent(DateTime.now(), name, data);
+   }
+ 
++  /// torchActual berubah -> tulis feeder_status.flash_actual (HANYA saat berubah).
++  void _onTorchActualChanged(bool actual) {
++    if (_disposing) return;
++    _supabase.setFlashActual(actual);
++  }
++
++  /// Watchdog/init melaporkan masalah. Event cam_black/cam_stall sudah dikirim
++  /// manager lewat onEvent (jangan dobel). Di sini: feeder_status.cam_issue +
++  /// cam_issue_at SEKALI per jenis per sesi. restartRecommended dipegang manager.
++  void _onCamIssue(String kind, Map<String, dynamic> data) {
++    if (_disposing) return;
++    if (!_camIssueReported.add(kind)) return;
++    _supabase.setCamIssue(kind, DateTime.now());
++  }
++
++  // ----------------------------- FLASH -------------------------------------
++
+   /// Flash dari tombol J2 / webapp (manual). on=false membatalkan manual DAN
+-  /// auto-sesi (user selalu menang).
+-  Future<void> _applyFlash(bool on) async {
++  /// auto-sesi (user selalu menang). [fromWeb] = berasal dari device_config.flash_on
++  /// (DB sudah berisi nilainya -> tidak ditulis balik).
++  Future<void> _applyFlash(bool on, {bool fromWeb = false}) async {
+     final before = _flashOn;
++    final manualBefore = _flashManual;
+     if (on) {
+       _flashManual = true;
+     } else {
+       _flashManual = false;
+       _flashAuto = false;
+     }
+-    await _afterFlashChange(before);
++    if (_flashManual && !manualBefore) {
++      _flashManualSince = DateTime.now();
++      _flashViewerSeen = _isLiveCamActive;
++    }
++    if (!_flashManual) {
++      _flashManualSince = null;
++      _flashViewerSeen = false;
++    }
++    await _afterFlashChange(before, fromWeb: fromWeb);
+   }
+ 
+-  /// Flash otomatis selama sesi pakan (+ tail).
++  /// Flash otomatis selama sesi pakan (+ tail). Hanya dinyalakan bila
++  /// calib.flash_auto_session = true (default false, SPEC 4).
+   Future<void> _setFlashAuto(bool on) async {
+     if (_flashAuto == on) return;
+     final before = _flashOn;
+@@ -1504,182 +1457,59 @@
+     await _afterFlashChange(before);
+   }
+ 
+-  Future<void> _afterFlashChange(bool before) async {
+-    if (mounted && !_disposing) setState(() {});
+-    _reconcileCameraState();
+-    try {
+-      await _enqueueCam(_applyTorchImpl);
+-    } catch (_) {}
+-    if (before != _flashOn) {
+-      _devLog.add(
+-        LogDirection.info,
+-        'HP',
+-        'Flash ${_flashOn ? "ON" : "OFF"} (manual=$_flashManual auto=$_flashAuto)',
+-      );
+-      // Tulis balik supaya webapp melihat status SEBENARNYA. Echo realtime
+-      // dari tulisan ini dibandingkan ke _flashOn (efektif), jadi tidak
+-      // mengubah flash manual menjadi auto atau sebaliknya.
+-      if (!_disposing) _supabase.setFlashOn(_flashOn);
+-    }
+-  }
+-
+-  /// SATU-SATUNYA tempat start/stop image stream (dijalankan lewat antrean).
+-  Future<void> _ensureStreamImpl() async {
+-    final controller = _controller;
+-    if (controller == null || !controller.value.isInitialized) return;
+-
+-    final needStream =
+-        _isFeeding || _isTailRecording || _isAiTestMode || _isLiveCamActive;
+-    final isStreaming = controller.value.isStreamingImages;
+-
+-    if (needStream && !isStreaming) {
+-      try {
+-        await controller.startImageStream(_onFrame);
+-        _streamStartedAt = DateTime.now();
+-        _lastFrameAt = null;
+-        _blackFrames = 0;
+-        _blackSince = null;
+-      } catch (e) {
+-        _devLog.add(LogDirection.error, 'HP', 'Gagal start image stream: $e');
+-      }
+-    } else if (!needStream && isStreaming) {
+-      try {
+-        await controller.stopImageStream();
+-      } catch (_) {}
+-    }
++  /// J2 sendiri mematikan flash MANUAL (timeout / viewer hilang). Flash
++  /// otomatis sesi (bila ada) tidak ikut dibatalkan.
++  void _flashOffManual(String reason) {
++    if (!_flashManual) return;
++    final before = _flashOn;
++    _flashManual = false;
++    _flashManualSince = null;
++    _flashViewerSeen = false;
++    _devLog.add(LogDirection.info, 'HP', 'Flash manual dimatikan J2: $reason');
++    _afterFlashChange(before);
+   }
+ 
+-  // ----------------------- WATCHDOG + PROTEKSI FRAME HITAM -----------------
+-
+-  void _startCamWatchdog() {
+-    _camWatchdog?.cancel();
+-    _camWatchdog = Timer.periodic(
+-      const Duration(seconds: 2),
+-      (_) => _camWatchdogTick(),
++  /// Dipanggil dari tick _resourceTimer (10 dtk).
++  void _checkFlashTimeout() {
++    final since = _flashManualSince;
++    if (!_flashManual || since == null) return;
++    final limit = Duration(
++      milliseconds: (widget.config.flashTimeoutSeconds * 1000).round(),
+     );
++    if (DateTime.now().difference(since) >= limit) {
++      _flashOffManual('timeout ${limit.inSeconds} dtk');
++    }
+   }
+ 
+-  void _stopCamWatchdog() {
+-    _camWatchdog?.cancel();
+-    _camWatchdog = null;
+-  }
+-
+-  void _camWatchdogTick() {
+-    final c = _controller;
+-    if (c == null || _camRestarting || !mounted || _disposing) return;
+-    final now = DateTime.now();
+-    if (c.value.hasError) {
+-      _onCamFault('controller_error: ${c.value.errorDescription}');
+-      return;
+-    }
+-    if (!c.value.isStreamingImages) return;
+-    final ref = _lastFrameAt ?? _streamStartedAt;
+-    if (ref != null && now.difference(ref) > const Duration(seconds: 5)) {
+-      _onCamFault('no_frames');
+-      return;
+-    }
+-    final bs = _blackSince;
+-    if (bs != null && now.difference(bs) > const Duration(seconds: 3)) {
+-      _onCamFault('black_frames');
+-      return;
+-    }
+-    // Kamera sehat >20 dtk sejak restart terakhir -> reset hitungan percobaan.
+-    final lr = _camLastRestartAt;
+-    if (_camRestartAttempts > 0 &&
+-        _lastFrameAt != null &&
+-        _blackSince == null &&
+-        (lr == null || now.difference(lr) > const Duration(seconds: 20))) {
+-      _camRestartAttempts = 0;
+-    }
++  /// Tulis device_config.flash_on=false BERSYARAT (hanya bila masih true).
++  /// Gagal (mis. WiFi mati) -> _flashOffDirty, diulang tick resource.
++  Future<void> _pushFlashOff() async {
++    final ok = await _supabase.setFlashOffIfOn();
++    _flashOffDirty = !ok;
+   }
+ 
+-  void _onCamFault(String reason) {
+-    final now = DateTime.now();
+-    final until = _camGiveUpUntil;
+-    if (until != null && now.isBefore(until)) return;
+-    if (_camRestartAttempts >= _camMaxRestarts) {
+-      _camGiveUpUntil = now.add(const Duration(minutes: 10));
+-      _camRestartAttempts = 0;
++  Future<void> _afterFlashChange(bool before, {bool fromWeb = false}) async {
++    if (mounted && !_disposing) setState(() {});
++    final changed = before != _flashOn;
++    if (changed) {
+       _devLog.add(
+-        LogDirection.error,
++        LogDirection.info,
+         'HP',
+-        'Kamera gagal pulih setelah $_camMaxRestarts restart ($reason). '
+-            'Menyerah 10 menit -- AI diam (tanpa STOP/LANJUT), perlu restart app/HP.',
++        'Flash ${_flashOn ? "ON" : "OFF"} diminta (manual=$_flashManual auto=$_flashAuto)',
+       );
+-      _showSnack('Kamera bermasalah: restart app/HP mungkin diperlukan');
+-      return;
+     }
+-    _restartCamera(reason);
+-  }
+-
+-  /// Restart lunak kamera: dispose penuh -> jeda HAL -> init -> stream -> torch.
+-  /// Aman dipanggil di tengah sesi: EMA memakai timestamp nyata (dt di-clamp),
+-  /// dan frame hitam tidak pernah diproses (lihat _onFrame).
+-  Future<void> _restartCamera(String reason) async {
+-    if (_camRestarting) return;
+-    _camRestarting = true;
+-    _camRestartAttempts++;
+-    _camLastRestartAt = DateTime.now();
+-    _devLog.add(
+-      LogDirection.error,
+-      'HP',
+-      'Restart kamera #$_camRestartAttempts: $reason',
+-    );
+-    _recorder.addEvent(DateTime.now(), 'cam_restart', {
+-      'reason': reason,
+-      'n': _camRestartAttempts,
+-    });
+-    try {
+-      await _enqueueCam(() async {
+-        await _disposeCameraImpl();
+-        if (_needsCamera) await _initCameraImpl();
+-        await _ensureStreamImpl();
+-        await _applyTorchImpl();
+-      });
+-      if (_diagTimer != null && _controller != null) {
+-        // Sesi rekam masih jalan: kunci ulang fokus/exposure setelah konvergen.
+-        _camLockTimer?.cancel();
+-        _camLockTimer = Timer(const Duration(seconds: 5), _lockCameraAuto);
++    // Torch fisik diatur CameraManager (torchActual dilaporkan lewat onTorchChanged).
++    final applied = _reconcileCameraState();
++    if (changed && !_disposing) {
++      if (fromWeb) {
++        _flashOffDirty = false; // DB sudah sama dengan niat
++      } else if (_flashOn) {
++        _supabase.setFlashOn(true); // cerminkan flash nyala ke webapp
++      } else {
++        _pushFlashOff(); // bersyarat; bukan menimpa klik web yang lebih baru
+       }
+-    } catch (e) {
+-      _devLog.add(LogDirection.error, 'HP', 'Restart kamera gagal: $e');
+-    } finally {
+-      _camRestarting = false;
+-    }
+-  }
+-
+-  /// Cek murni-murah (~256 byte) apakah frame "rata & gelap" = kamera hitam.
+-  /// Scene gelap sungguhan masih punya noise sensor (rentang > 2), jadi tidak
+-  /// ikut terdeteksi sebagai rusak.
+-  void _sampleFrameHealth(CameraImage image) {
+-    final now = DateTime.now();
+-    _lastFrameAt = now;
+-    final bytes = image.planes[0].bytes;
+-    if (bytes.isEmpty) {
+-      _markBlack(now);
+-      return;
+     }
+-    final step = math.max(1, bytes.length ~/ 256);
+-    int mn = 255, mx = 0, sum = 0, n = 0;
+-    for (int i = 0; i < bytes.length; i += step) {
+-      final v = bytes[i];
+-      if (v < mn) mn = v;
+-      if (v > mx) mx = v;
+-      sum += v;
+-      n++;
+-    }
+-    final mean = n == 0 ? 0.0 : sum / n;
+-    if ((mx - mn) <= 2 && mean < 24) {
+-      _markBlack(now);
+-    } else {
+-      _blackFrames = 0;
+-      _blackSince = null;
+-    }
+-  }
+-
+-  void _markBlack(DateTime now) {
+-    _blackFrames++;
+-    if (_blackFrames >= 5) _blackSince ??= now;
++    await applied;
+   }
+ 
+   /// Dipanggil LiveCamService HANYA saat status "ada viewer" BENAR-BENAR
+@@ -1693,6 +1523,7 @@
+       if (_isLiveCamActive) return;
+       setState(() => _isLiveCamActive = true);
+       _lastLiveCamSentAt = null;
++      if (_flashManual) _flashViewerSeen = true; // 🟢 REVISI (P1 / SPEC 3.3)
+       _reconcileCameraState();
+       return;
+     }
+@@ -1703,25 +1534,30 @@
+       if (!mounted || !_isLiveCamActive) return;
+       setState(() => _isLiveCamActive = false);
+       _lastLiveCamSentAt = null;
++      // 🟢 REVISI (P1 / SPEC 3.3): viewer yang tadinya ada lalu hilang
++      // (presence leave / ping habis) -> flash manual mati. Batas durasi
++      // live-cam (isCapped) BUKAN viewer hilang. Viewer yang tak pernah ada
++      // -> hanya timeout/web yang berlaku.
++      if (_flashManual && _flashViewerSeen && !_liveCam.isCapped) {
++        _flashOffManual('viewer live-cam hilang');
++      }
+       _reconcileCameraState();
+     });
+   }
+ 
+   @override
+   void didChangeAppLifecycleState(AppLifecycleState state) {
+-    if (state == AppLifecycleState.paused) {
+-      // OS mencabut kamera saat app di background -- tutup bersih dulu supaya
+-      // tidak ada controller "zombie" yang kelihatan hidup tapi hitam.
+-      _enqueueCam(_disposeCameraImpl).catchError((_) {});
+-    } else if (state == AppLifecycleState.resumed) {
+-      _reconcileCameraState();
++    // 🟢 REVISI (P1 / SPEC 3.1): cek kesehatan controller saat `resumed`
++    // dilakukan CameraManager sendiri (WidgetsBindingObserver di dalamnya).
++    // Layar tidak lagi menutup kamera saat `paused` lewat jalur terpisah.
++    if (state == AppLifecycleState.resumed) {
++      _reconcileCameraState(); // idempotent
+     }
+   }
+ 
+   Future<void> _toggleCameraOverride() async {
+     setState(() => _cameraForcedOn = !_cameraForcedOn);
+     if (_cameraForcedOn) {
+-      await _initCamera();
+       _devLog.add(
+         LogDirection.info,
+         'HP',
+@@ -1729,8 +1565,8 @@
+       );
+     } else {
+       _devLog.add(LogDirection.info, 'HP', 'Kamera override dimatikan');
+-      _reconcileCameraState();
+     }
++    await _reconcileCameraState();
+   }
+ 
+   void _startDiagUpload() {
+@@ -1756,6 +1592,7 @@
+     _diagTimer = null;
+     _camLockTimer?.cancel();
+     _camLockTimer = null;
++    _cam.unlockAuto(); // 🟢 REVISI (P1): rekaman selesai -> lepas kunci fokus/exposure
+     await _flushDiag(sessionId: sessionId, trial: trial, force: true);
+   }
+ 
+@@ -1793,33 +1630,17 @@
+     }
+   }
+ 
+-  Future<void> _lockCameraAuto() async {
+-    final c = _controller;
+-    if (c == null || !c.value.isInitialized) return;
+-    try {
+-      await c.setFocusMode(FocusMode.locked);
+-    } catch (e) {
+-      _devLog.add(LogDirection.info, 'HP', 'Kunci fokus tidak didukung: $e');
+-    }
+-    try {
+-      await c.setExposureMode(ExposureMode.locked);
+-    } catch (e) {
+-      _devLog.add(LogDirection.info, 'HP', 'Kunci exposure tidak didukung: $e');
+-    }
+-    _recorder.addEvent(DateTime.now(), 'cam_lock', null);
+-    _devLog.add(
+-      LogDirection.info,
+-      'HP',
+-      'Fokus & exposure dikunci untuk sesi AI',
+-    );
+-  }
++  /// 🟢 REVISI (P1): kunci fokus+exposure dikerjakan CameraManager (tunggu
++  /// torch settle 2 dtk, re-lock bila torch berubah). Event `cam_lock` dikirim
++  /// manager lewat onEvent -- jangan dobel di sini.
++  Future<void> _lockCameraAuto() => _cam.lockAuto();
+ 
+   /// Catat resolusi frame SEBENARNYA sekali per sesi (preset "medium" itu
+   /// perkiraan, ukuran riil bergantung perangkat). Bandingkan antar sesi.
+   void _logCamOnce(CameraImage image, DateTime now) {
+     if (_camLogged) return;
+     _camLogged = true;
+-    final ps = _controller?.value.previewSize;
++    final ps = _cam.previewSize; // 🟢 REVISI (P1)
+     _recorder.addEvent(now, 'cam', {
+       'w': image.width,
+       'h': image.height,
+@@ -1949,7 +1770,18 @@
+     // Manual", keduanya memanggil fungsi ini.
+     if (_isTailRecording) await _endTail('new_session');
+ 
+-    await _initCamera();
++    // 🟢 REVISI (P1 / SPEC 3.2): sesi baru -> reset penanda masalah kamera
++    // (lokal + DB, bersyarat: hanya bila cam_issue sebelumnya tidak null).
++    _camIssueReported.clear();
++    _supabase.clearCamIssueIfSet();
++
++    // 🟢 REVISI (P1): recorder di-reset SEBELUM kamera dibuka supaya event
++    // cam_open/torch/cam_lock sesi ini ikut terekam (dulu direset sesudahnya).
++    _recorder.reset();
++    _recorder.setCfg(_cfgSnapshot(dryRun: false));
++
++    // _sessionStarting = true (dari _startFeeding) -> needCamera true.
++    await _reconcileCameraState();
+     if (!_isCameraActive) {
+       _devLog.add(
+         LogDirection.error,
+@@ -1959,12 +1791,16 @@
+       return;
+     }
+ 
+-    // Flash otomatis selama sesi pakan (ovr maupun RTC lewat jalur ini).
+-    await _setFlashAuto(true);
++    // 🟢 REVISI (P1 / SPEC 3.3): flash otomatis sesi HANYA bila
++    // calib.flash_auto_session = true (default false). Torch nyala SEBELUM
++    // exposure dikunci (lock dipasang _startDiagUpload -> manager).
++    await _setFlashAuto(widget.config.flashAutoSession);
+ 
+     setState(() {
+       _isFeeding = true;
+       _statusText = 'Feeding...';
++      _lastEma = 0; // 🟢 REVISI (P1 / SPEC 3.5): jangan bawa EMA/peak sesi lama
++      _lastPeak = 0;
+     });
+ 
+     _supabase
+@@ -1980,8 +1816,7 @@
+     _extractor.reset();
+     _trigger = _newTrigger(dryRun: false);
+     _lastPhase = null;
+-    _recorder.reset();
+-    _recorder.setCfg(_cfgSnapshot(dryRun: false));
++    // (🟢 REVISI P1: _recorder.reset()/setCfg dipindah ke atas, sebelum kamera dibuka)
+     _startDiagUpload();
+     _lastProcessedAt = null;
+ 
+@@ -2043,8 +1878,8 @@
+       _queueTelemetryUpload(_lastTelemetry!);
+     });
+ 
+-    await _ensureImageStreamState();
+-    if (_controller?.value.isStreamingImages != true) {
++    await _reconcileCameraState(); // needStream sekarang true -> stream dinyalakan
++    if (!_cam.isStreaming) {
+       _showSnack('Gagal akses kamera');
+     }
+   }
+@@ -2246,11 +2081,10 @@
+     // live-cam harus independen dari sedang feeding/AI test/idle atau tidak).
+     _maybeCaptureLiveCamFrame(image);
+ 
+-    // Kesehatan frame: kalau hitam terkonfirmasi, AI DIAM (frame tidak
+-    // diproses) -- jangan sampai frame hitam terbaca sebagai "lele kenyang"
+-    // dan memicu STOP palsu. Watchdog yang merestart kamera.
+-    _sampleFrameHealth(image);
+-    if (_camBlackConfirmed) return;
++    // 🟢 REVISI (P1 / SPEC 2 & 3.2): gerbang "frame hitam -> AI diam" DIBUANG.
++    // Kamera hitam = kurang pakan (1 putaran), BUKAN overfeeding, jadi tidak
++    // perlu penanganan "frame invalid" khusus. Deteksi black/stall dilakukan
++    // watchdog CameraManager (hanya mencatat; tanpa restart kamera).
+ 
+     if (_isAiTestMode) {
+       _onAiTestFrame(image);
+@@ -2397,7 +2231,10 @@
+     // TAIL (rev): sesi baru (Uji Coba AI) memotong tail yang sedang
+     // berjalan (KEPUTUSAN #5).
+     if (_isTailRecording) await _endTail('uji_coba_ai');
+-    await _initCamera();
++    // 🟢 REVISI (P1): recorder di-reset sebelum kamera dibuka (event cam_* ikut terekam).
++    _recorder.reset();
++    _recorder.setCfg(_cfgSnapshot(dryRun: true));
++    await _reconcileCameraState();
+     if (!_isCameraActive) {
+       _devLog.add(
+         LogDirection.error,
+@@ -2415,6 +2252,8 @@
+       _statusText = durationMin != null
+           ? 'Uji Coba AI ($durationMin menit)...'
+           : 'Uji Coba AI (manual, tanpa timeout)...';
++      _lastEma = 0; // 🟢 REVISI (P1 / SPEC 3.5)
++      _lastPeak = 0;
+     });
+ 
+     _extractor.reset();
+@@ -2422,8 +2261,7 @@
+     // produksi, dalam mode dry-run (menghitung semua, tidak pernah STOP).
+     _trigger = _newTrigger(dryRun: true);
+     _lastPhase = null;
+-    _recorder.reset();
+-    _recorder.setCfg(_cfgSnapshot(dryRun: true));
++    // (🟢 REVISI P1: _recorder.reset()/setCfg dipindah ke atas, sebelum kamera dibuka)
+     _startDiagUpload();
+     _lastProcessedAt = null;
+     _lastRawScore = null;
+@@ -2455,7 +2293,7 @@
+       );
+     }
+ 
+-    await _ensureImageStreamState();
++    await _reconcileCameraState();
+     _devLog.add(
+       LogDirection.info,
+       'HP',
+@@ -2613,7 +2451,6 @@
+     _disposing = true;
+     WidgetsBinding.instance.removeObserver(this);
+     _liveCamOffTimer?.cancel();
+-    _stopCamWatchdog();
+     _resourceTimer?.cancel();
+     _keepAliveTimer?.cancel();
+     _metricsTimer?.cancel();
+@@ -2629,7 +2466,7 @@
+       // sudah dijaga `mounted`, jadi aman dipanggil di sini.
+       _endTail('dispose');
+     }
+-    _disposeCameraHardware();
++    _cam.disposeAll(); // 🟢 REVISI (P1): tanpa await; manager menutup kamera tuntas
+     _liveCam.dispose();
+     _supabase.dispose();
+     _btService.dispose();
+@@ -2810,6 +2647,8 @@
+   }
+ 
+   Widget _buildCameraArea() {
++    // 🟢 REVISI (P1): controller dari CameraManager; null saat sedang menutup.
++    final camCtrl = _cam.controller;
+     return Center(
+       child: AspectRatio(
+         aspectRatio: 3 / 4,
+@@ -2820,13 +2659,13 @@
+           child: Container(
+             color: Colors.black,
+             margin: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+-            child: _isCameraActive
++            child: camCtrl != null
+                 // 🟢 REVISI: Stack(expand) menjaga constraint CameraPreview
+                 // tetap ketat seperti sebelumnya; hanya menambah label kecil.
+                 ? Stack(
+                     fit: StackFit.expand,
+                     children: [
+-                      CameraPreview(_controller!),
++                      CameraPreview(camCtrl),
+                       if (_isDevMode)
+                         const Positioned(
+                           right: 6,
+@@ -3037,13 +2876,9 @@
+                   _isAiTestMode ? 'Selesai Uji Coba AI' : 'Uji Coba AI',
+                 ),
+               ),
+-              OutlinedButton.icon(
+-                onPressed: _camRestarting
+-                    ? null
+-                    : () => _restartCamera('manual_dev'),
+-                icon: const Icon(Icons.restart_alt),
+-                label: const Text('Restart Kamera'),
+-              ),
++              // 🟢 REVISI (P1): tombol 'Restart Kamera' dihapus -- tutup-buka
++              // kamera tidak pernah memulihkan layar hitam (SPEC 2); pemulihan
++              // = restart app terjadwal saat idle (Room 9).
+             ],
+           ),
+           const SizedBox(height: 8),

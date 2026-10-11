@@ -20,6 +20,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 ///     dengan pola yang sama seperti label_cmd.seq/_lastLabelSeq --
 ///     feeding_screen menyimpan _lastTailCancelSeq dan hanya memproses
 ///     seq yang lebih besar dari sebelumnya.
+/// 🟢 REVISI (P1 / SPEC 4): kunci calib opsional baru (TIDAK menaikkan
+/// _calibVersion, TIDAK disimpan ke prefs -- key tidak ada = default J2):
+///   - flash_timeout_s (default 600, clamp 30..3600): batas nyala flash manual.
+///   - flash_renew (int, naik): mereset timer flash manual (runtime saja).
+///   - flash_auto_session (bool, default false): flash nyala otomatis selama sesi.
+///   - live_cam_max_min (default 30, clamp 0..240; 0 = tanpa batas).
 /// Kunci lama (decay_ratio, min_peak, debounce_s, startup_timeout_s,
 /// round_ratio, activity_floor) sudah TIDAK dipakai dan diabaikan.
 ///
@@ -148,6 +154,26 @@ class FeederConfig {
     return seconds.clamp(tailMin, tailMax).toDouble();
   }
 
+  /// 🟢 REVISI (P1 / SPEC 3.3, 3.4, 4): nilai runtime dari calib webapp.
+  /// SENGAJA tidak ikut load()/save(): tanpa key di calib = default di bawah,
+  /// diterapkan di feeding_screen._applyCalib.
+  double flashTimeoutSeconds;
+  bool flashAutoSession;
+  int liveCamMaxMinutes;
+
+  static const double flashTimeoutDefault = 600.0;
+  static const double flashTimeoutMin = 30.0;
+  static const double flashTimeoutMax = 3600.0;
+  static const int liveCamMaxMinDefault = 30;
+  static const int liveCamMaxMinCeil = 240;
+
+  static double clampFlashTimeout(double seconds) =>
+      seconds.clamp(flashTimeoutMin, flashTimeoutMax).toDouble();
+
+  /// 0 tetap 0 (tanpa batas). Selain itu di-clamp ke 0..[liveCamMaxMinCeil].
+  static int clampLiveCamMaxMin(int minutes) =>
+      minutes.clamp(0, liveCamMaxMinCeil).toInt();
+
   /// Berapa baris log traffic terakhir yang disimpan di panel Dev
   /// (lihat dev_log.dart). Dibatasi kecil biar hemat RAM.
   int devLogMaxLines;
@@ -183,6 +209,10 @@ class FeederConfig {
     this.liveCamIntervalSeconds = 3.0,
     // TAIL (rev): default 60s, clamp [45, 120], 0 = mati.
     this.tailRecordSeconds = 60.0,
+    // 🟢 REVISI (P1): default flash/live-cam (SPEC bagian 4).
+    this.flashTimeoutSeconds = flashTimeoutDefault,
+    this.flashAutoSession = false,
+    this.liveCamMaxMinutes = liveCamMaxMinDefault,
     // Dinaikkan dari 10 -> 150: nilai lama terlalu kecil untuk layar
     // penuh + filter (item 2) -- 10 baris habis dalam hitungan detik saat
     // traffic BT ramai. HP idle sebagian besar waktu, jadi menyimpan ~150
