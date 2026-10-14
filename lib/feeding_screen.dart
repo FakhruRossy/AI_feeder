@@ -236,6 +236,14 @@ class _FeedingScreenState extends State<FeedingScreen>
   // (mis. 1 lalu 2) tetap boleh jalan paralel. Lihat _clearRstInDb.
   int _rstClearingValue = 0;
 
+  // ROOM 2: antrean reboot ESP (sys.rr) -> tabel esp_reboots. ASUMSI: tidak
+  // ada penyimpanan lokal bawaan, jadi antrean hanya di memori (hilang bila
+  // app mati) dan dikirim ulang oleh tick _resourceTimer 10 dtk saat koneksi
+  // pulih. Dibatasi 50 entri (terlama dibuang).
+  final List<Map<String, dynamic>> _rebootBacklog = <Map<String, dynamic>>[];
+  bool _rebootBusy = false;
+  static const int _rebootBacklogMax = 50;
+
   /// Seq label terakhir dari webapp (device_config.label_cmd.seq). Gate supaya
   /// label lama yang nyangkut di DB tidak dicatat ulang saat app restart.
   int _lastLabelSeq = 0;
@@ -363,6 +371,7 @@ class _FeedingScreenState extends State<FeedingScreen>
         if (!connected) _pushBtStatus(false);
       },
       onTelemetry: _onTelemetry,
+      onEspReboot: _onEspReboot, // ROOM 2
       onLog: _devLog.add,
     );
 
@@ -429,6 +438,53 @@ class _FeedingScreenState extends State<FeedingScreen>
     _btStatusLast = connected;
     final ok = await _supabase.updateBtStatus(connected);
     if (_btStatusLast == connected) _btStatusDirty = !ok;
+  }
+
+  // ---------------------------------------------------------------------
+  // ROOM 2: REBOOT ESP (sys.rr) -> esp_reboots
+  // ---------------------------------------------------------------------
+
+  void _onEspReboot(int reason, bool intentional, DateTime at) {
+    _devLog.add(
+      LogDirection.info,
+      'BT',
+      'ESP reboot terdeteksi (sys.rr=$reason, disengaja=$intentional)',
+    );
+    _rebootBacklog.add({
+      'reason': reason,
+      'intentional': intentional,
+      'at': at,
+    });
+    while (_rebootBacklog.length > _rebootBacklogMax) {
+      _rebootBacklog.removeAt(0);
+    }
+    _flushRebootBacklog();
+  }
+
+  /// Kirim antrean satu per satu berurutan; berhenti di kegagalan pertama
+  /// (dicoba lagi oleh tick resource 10 dtk).
+  Future<void> _flushRebootBacklog() async {
+    if (_rebootBusy || _rebootBacklog.isEmpty) return;
+    _rebootBusy = true;
+    try {
+      while (_rebootBacklog.isNotEmpty) {
+        final item = _rebootBacklog.first;
+        await _supabase.insertEspReboot(
+          reason: item['reason'] as int,
+          intentional: item['intentional'] as bool,
+          at: item['at'] as DateTime,
+        );
+        _rebootBacklog.removeAt(0);
+      }
+    } catch (e) {
+      _devLog.add(
+        LogDirection.error,
+        'SUPA',
+        'Gagal catat esp_reboots (${_rebootBacklog.length} ditahan): $e',
+      );
+    } finally {
+      _rebootBusy = false;
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1384,6 +1440,7 @@ class _FeedingScreenState extends State<FeedingScreen>
     _resourceTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
       if (!mounted) return;
       if (_btStatusDirty) _pushBtStatus(_btStatusLast);
+      if (_rebootBacklog.isNotEmpty) _flushRebootBacklog(); // ROOM 2
       // 🟢 REVISI (P1 / SPEC 3.3): timeout flash manual + ulang tulis
       // flash_on=false yang gagal. Numpang tick yang sudah ada (tanpa timer baru).
       _checkFlashTimeout();
@@ -1441,7 +1498,68 @@ class _FeedingScreenState extends State<FeedingScreen>
   /// Future selesai saat kebutuhan terbaru terpenuhi (tidak melempar).
   Future<void> _reconcileCameraState() {
     if (_disposing) return Future<void>.value();
+    _logCameraHolders();
     return _cam.apply(_needsCamera, _needsStream, _flashOn);
+  }
+
+  String _lastHoldersSig = '\u0000';
+
+  /// Catat ke dev log SETIAP kali daftar penahan kamera berubah, supaya
+  /// "kenapa kamera nyala / kenapa tidak nyala" selalu terlihat sebagai [CAM].
+  void _logCameraHolders() {
+    final sig = _cameraHolders().join(' | ');
+    if (sig == _lastHoldersSig) return;
+    _lastHoldersSig = sig;
+    _devLog.add(
+      LogDirection.info,
+      'CAM',
+      sig.isEmpty ? 'Penahan kamera: (tidak ada)' : 'Penahan kamera: $sig',
+    );
+  }
+
+  String _ago(DateTime? t) {
+    if (t == null) return '?';
+    final d = DateTime.now().difference(t);
+    if (d.inMinutes < 1) return '${d.inSeconds} dtk lalu';
+    if (d.inHours < 1) return '${d.inMinutes} mnt lalu';
+    return '${d.inHours} jam ${d.inMinutes % 60} mnt lalu';
+  }
+
+  /// Daftar siapa yang sekarang membuat kamera tetap terbuka. [detail]=true
+  /// menambah keterangan waktu/durasi (untuk snackbar; jangan dipakai untuk log
+  /// karena berubah tiap detik).
+  List<String> _cameraHolders({bool detail = false}) {
+    final h = <String>[];
+    if (_isFeeding) h.add('Sesi pakan');
+    if (_isTailRecording) h.add('Rekam tail pasca-pakan');
+    if (_isAiTestMode) {
+      var s = 'Uji Coba AI';
+      if (detail) {
+        final dur = _trialDurationMin == null
+            ? 'tanpa batas waktu'
+            : 'durasi $_trialDurationMin mnt';
+        s += ' (mulai ${_ago(_trialStartedAt)}, $dur)';
+      }
+      h.add(s);
+    }
+    if (_isLiveCamActive) {
+      var s = 'Live-cam (ada viewer di channel)';
+      if (detail && _liveCamOffTimer != null) {
+        s += ' - viewer sudah hilang, menunggu 20 dtk';
+      }
+      h.add(s);
+    }
+    if (_flashManual) {
+      h.add(
+        detail
+            ? 'Flash manual (web/tombol J2, nyala ${_ago(_flashManualSince)})'
+            : 'Flash manual',
+      );
+    }
+    if (_flashAuto) h.add('Flash otomatis sesi pakan');
+    if (_cameraForcedOn) h.add('Override Dev (ketuk kotak kamera)');
+    if (_sessionStarting) h.add('Sesi pakan sedang dimulai');
+    return h;
   }
 
   /// 🟢 REVISI (P1/R9 / SPEC 3.6): true = SEMUA idle -> aman restart app.
@@ -1455,6 +1573,7 @@ class _FeedingScreenState extends State<FeedingScreen>
     if (_sessionStarting || _cameraForcedOn || _flashOn) return false;
     if (_cam.isCameraActive || _cam.torchActual) return false;
     if (_cfgPushing > 0) return false;
+    if (_rebootBusy || _rebootBacklog.isNotEmpty) return false; // ROOM 2
     if (_diagTimer != null || _diagBusy || _diagBacklog.isNotEmpty) {
       return false;
     }
@@ -1467,7 +1586,10 @@ class _FeedingScreenState extends State<FeedingScreen>
     // Rantai upload kosong: future yang sudah selesai menjalankan callback-nya
     // dalam satu putaran microtask.
     var uploadDone = false;
-    _uploadChain.then((_) => uploadDone = true, onError: (_) => uploadDone = true);
+    _uploadChain.then(
+      (_) => uploadDone = true,
+      onError: (_) => uploadDone = true,
+    );
     await Future<void>.microtask(() {});
     await Future<void>.microtask(() {});
     return uploadDone && !_disposing;
@@ -1590,6 +1712,13 @@ class _FeedingScreenState extends State<FeedingScreen>
   /// berkedip (reconnect socket) tidak membuat kamera dibuka-tutup berulang.
   void _onLiveCamWatchersChanged(bool active) {
     if (!mounted) return;
+    _devLog.add(
+      LogDirection.info,
+      'CAM',
+      active
+          ? 'Live-cam: viewer ADA (presence tidak kosong)'
+          : 'Live-cam: viewer HILANG (kamera ditutup 20 dtk lagi bila tidak kembali)',
+    );
     if (active) {
       _liveCamOffTimer?.cancel();
       _liveCamOffTimer = null;
@@ -2254,12 +2383,20 @@ class _FeedingScreenState extends State<FeedingScreen>
     // callback ini) -- WAJIB, karena buffer asli dari plugin kamera cuma
     // valid selama callback _onFrame berjalan. Setelah ini, job aman
     // dikirim lintas isolate kapan saja.
-    final job = buildLiveCamJob(
-      image,
-      targetWidth: _liveCamTargetWidth,
-      targetHeight: _liveCamTargetHeight,
-      jpegQuality: _liveCamJpegQuality,
-    );
+    final LiveCamFrameJob job;
+    try {
+      job = buildLiveCamJob(
+        image,
+        targetWidth: _liveCamTargetWidth,
+        targetHeight: _liveCamTargetHeight,
+        jpegQuality: _liveCamJpegQuality,
+      );
+    } catch (e) {
+      // Tanpa ini flag encode tersangkut true dan live-cam diam sampai restart.
+      _isEncodingLiveCamFrame = false;
+      _devLog.add(LogDirection.error, 'CAM', 'Gagal siapkan job live-cam: $e');
+      return;
+    }
 
     // 🟢 INI BAGIAN PENTINGNYA: buildLiveCamFrame() jalan di ISOLATE
     // TERPISAH lewat compute(). Encode JPEG (downsample + kompres) TIDAK
@@ -2268,6 +2405,7 @@ class _FeedingScreenState extends State<FeedingScreen>
     // live-cam nyala BARENG sesi AI/feeding, keputusan lanjut/stop pakan
     // tidak pernah tertunda/tersela oleh kerja encode JPEG ini.
     buildLiveCamFrame(job)
+        .timeout(const Duration(seconds: 10))
         .then((jpegBytes) {
           _isEncodingLiveCamFrame = false;
           if (jpegBytes == null || !_isLiveCamActive) return;
@@ -2515,9 +2653,14 @@ class _FeedingScreenState extends State<FeedingScreen>
     _resetInactivityTimer(); // masih terang -> perpanjang timer
   }
 
-  void _showSnack(String msg) {
+  void _showSnack(String msg, {Duration? duration}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        duration: duration ?? const Duration(milliseconds: 4000),
+      ),
+    );
   }
 
   @override
@@ -2714,10 +2857,24 @@ class _FeedingScreenState extends State<FeedingScreen>
   void _onCameraBoxTap() {
     if (!_isDevMode) return; // hanya Mode Dev
     if (_isFeeding || _isAiTestMode || _isLiveCamActive || _flashOn) {
+      final holders = _cameraHolders(detail: true);
       _showSnack(
-        'Kamera sedang dipakai sesi AI/live-cam/flash, tidak bisa dimatikan manual',
+        'Kamera ditahan oleh:\n- ${holders.join('\n- ')}\n'
+        '(tidak bisa dimatikan manual selama ada penahan)',
+        duration: const Duration(seconds: 8),
       );
       return; // jangan ubah _cameraForcedOn
+    }
+    if (_cam.isCameraActive && _cameraHolders().isEmpty) {
+      // Kamera terbuka tapi TIDAK ada flag penahan -> bug sinkronisasi, bukan
+      // "ada yang pakai". Laporkan jelas supaya tidak dikira presence nyangkut.
+      _showSnack(
+        'Kamera terbuka tapi tidak ada penahan di layar ini '
+        '(sinkronisasi CameraManager). Mencoba reconcile ulang.',
+        duration: const Duration(seconds: 6),
+      );
+      _reconcileCameraState();
+      return;
     }
     _toggleCameraOverride(); // dipanggil apa adanya
   }

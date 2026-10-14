@@ -312,6 +312,21 @@ class FeederSupabaseService {
     await _client.from('ai_diag_log').insert(payload);
   }
 
+  /// ROOM 2: catat satu reboot ESP ke tabel `esp_reboots`. Melempar exception
+  /// kalau gagal supaya caller menyimpan antrean dan mengulang.
+  Future<void> insertEspReboot({
+    required int reason,
+    required bool intentional,
+    required DateTime at,
+  }) async {
+    await _client.from('esp_reboots').insert({
+      'device_id': rowId,
+      'created_at': at.toUtc().toIso8601String(),
+      'reason': reason,
+      'intentional': intentional,
+    });
+  }
+
   /// Konfirmasi ke webapp bahwa label `label_cmd.seq` sudah masuk recorder.
   /// Hanya menulis kolom `label_ack` (bigint) -- tidak menyentuh kolom lain.
   Future<void> ackLabel(int seq) async {
@@ -432,7 +447,17 @@ class FeederSupabaseService {
             onConfigChanged(payload.newRecord);
           },
         )
-        .subscribe();
+        .subscribe((status, error) {
+          // Dulu .subscribe() tanpa callback: kalau channel config mati diam2,
+          // perintah dari webapp berhenti masuk tanpa jejak apa pun.
+          onLog?.call(
+            status == RealtimeSubscribeStatus.subscribed
+                ? LogDirection.info
+                : LogDirection.error,
+            'SUPA',
+            'Channel config: $status${error != null ? ' ($error)' : ''}',
+          );
+        });
   }
 
   void unsubscribeConfig() {

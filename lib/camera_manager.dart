@@ -527,6 +527,28 @@ class CameraManager with WidgetsBindingObserver {
   }
 
   // ======================================================================
+  // GUARD TIMEOUT: panggilan platform (HAL1) kadang tidak pernah kembali dan
+  // akan membekukan antrean serial. true = selesai tepat waktu.
+  // ======================================================================
+
+  bool _hangSeen = false;
+
+  Future<bool> _guard(String what, Future<void> f, Duration t) async {
+    try {
+      await f.timeout(t);
+      return true;
+    } on TimeoutException {
+      _hangSeen = true;
+      _log(
+        LogDirection.error,
+        '$what macet >${t.inSeconds}s (platform tidak kembali)',
+      );
+      _raise('init_failed', {'reason': 'hang', 'what': what}, event: false);
+      return false;
+    }
+  }
+
+  // ======================================================================
   // BUKA / TUTUP
   // ======================================================================
 
@@ -539,7 +561,7 @@ class CameraManager with WidgetsBindingObserver {
       // Open lama yang timeout harus tuntas (dan di-dispose) dulu: tidak boleh
       // ada dua controller.
       try {
-        await late.timeout(const Duration(seconds: 30));
+        await late.timeout(const Duration(seconds: 12));
       } catch (_) {}
       if (_disposed || (!force && !_wantCamera)) return 'aborted';
     }
@@ -628,17 +650,20 @@ class CameraManager with WidgetsBindingObserver {
     _streamStartedAt = null;
     _lastFrameAt = null;
     _blackSince = null;
+    _hangSeen = false;
     if (_torchActual) {
       try {
-        await s.setTorch(false);
+        await _guard('setTorch(off)', s.setTorch(false), const Duration(seconds: 4));
       } catch (_) {}
       _setTorchActual(false, reason);
     }
     try {
-      if (s.isStreaming) await s.stopStream();
+      if (s.isStreaming) {
+        await _guard('stopStream', s.stopStream(), const Duration(seconds: 4));
+      }
     } catch (_) {}
     try {
-      await s.dispose();
+      await _guard('dispose', s.dispose(), const Duration(seconds: 8));
     } catch (e) {
       _log(LogDirection.error, 'Gagal matiin kamera: $e');
     }
@@ -646,6 +671,8 @@ class CameraManager with WidgetsBindingObserver {
     _closing = false;
     _errorSeen = false;
     _lastClosedAt = DateTime.now();
+    // Ada panggilan yang macet: beri jeda ekstra sebelum buka ulang.
+    if (_hangSeen) _lastInitFailAt = DateTime.now();
     _event('cam_close', {'reason': reason});
     _log(LogDirection.info, 'Kamera dimatikan total ($reason)');
     _notifyState();
@@ -674,7 +701,12 @@ class CameraManager with WidgetsBindingObserver {
     _reportedStall = false;
     _reportedBlack = false;
     try {
-      await s.startStream(_onRawImage);
+      final ok = await _guard(
+        'startStream',
+        s.startStream(_onRawImage),
+        const Duration(seconds: 8),
+      );
+      if (!ok) _streamStartedAt = null;
     } catch (e) {
       _streamStartedAt = null;
       _log(LogDirection.error, 'Gagal start image stream: $e');
@@ -699,8 +731,12 @@ class CameraManager with WidgetsBindingObserver {
     // lockSettle.
     if (_locked) await _setLock(s, false);
     try {
-      await s.setTorch(want);
-      _setTorchActual(want, 'apply');
+      final ok = await _guard(
+        'setTorch',
+        s.setTorch(want),
+        const Duration(seconds: 5),
+      );
+      if (ok) _setTorchActual(want, 'apply');
     } catch (e) {
       _log(LogDirection.error, 'Gagal atur flash: $e');
       _event('torch', {'on': want, 'ok': false, 'err': '$e'});

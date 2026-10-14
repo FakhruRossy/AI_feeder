@@ -58,9 +58,32 @@ class LiveCamService {
   // 🟢 REVISI: konstanta SPEC 3.4
   static const Duration kResubscribeMin = Duration(seconds: 5);
   static const Duration kResubscribeMax = Duration(seconds: 60);
-  static const Duration kPingTimeout = Duration(seconds: 60);
+  static const Duration kPingTimeout = Duration(seconds: 25); // web ping tiap 10 dtk
   static const int kDefaultMaxMinutes = 30;
   static const int kMaxMinutesCeil = 240;
+
+  /// Viewer BARU (presence join) dianggap hidup selama jendela ini walau ping
+  /// pertamanya belum tiba. Lewat dari itu, hanya ping segar yang dihitung.
+  static const Duration kJoinGrace = Duration(seconds: 20);
+
+  /// Batas menunggu channel mencapai `subscribed` sebelum dibangun ulang.
+  static const Duration kJoinWatchdog = Duration(seconds: 15);
+
+  /// true = presence SAJA tidak cukup; viewer harus mengirim broadcast `ping`
+  /// (webapp terbaru melakukannya tiap 10 dtk). Ini yang mematikan presence
+  /// "hantu" (entri basi di server) yang dulu membuat kamera nyangkut nyala
+  /// bahkan setelah J2 di-restart. Set false untuk perilaku lama.
+  final bool requirePing;
+
+  /// PROBE LOOPBACK: channel dibuat dengan `self: true`, J2 mengirim broadcast
+  /// `hb` ke channelnya sendiri dan HARUS menerimanya kembali dalam
+  /// [kProbeWait]. Gagal = jalur terima channel ini "tuli" (join tampak sukses
+  /// tapi event tidak sampai -- gejala: web join normal, J2 tanpa log [CAM]
+  /// sama sekali, hanya pulih dengan restart app). Gagal 1x -> channel dibangun
+  /// ulang; gagal berturut-turut -> socket realtime di-reconnect.
+  static const Duration kProbeEvery = Duration(seconds: 20);
+  static const Duration kProbeWait = Duration(seconds: 5);
+  static const Duration kSocketReconnectMinGap = Duration(minutes: 2);
 
   bool _lastActive = false;
   bool _disposed = false;
@@ -80,12 +103,98 @@ class LiveCamService {
   DateTime? _activeSince;
   bool _capped = false;
 
+  // Grace untuk viewer yang baru join (requirePing).
+  Timer? _graceTimer;
+  bool _graceActive = false;
+
+  // Watchdog join: channel yang tidak pernah subscribed & tidak pernah error.
+  Timer? _joinWatch;
+  bool _isSubscribed = false;
+
+  String _lastSummary = '';
+
+  // Probe loopback.
+  Timer? _probeTimer;
+  Timer? _probeWaitTimer;
+  String? _probeId;
+  int _probeFails = 0;
+  DateTime? _lastSocketReconnectAt;
+
   LiveCamService({
     required this.channelName,
     required this.onWatchersChanged,
     this.onLog,
     int maxMinutes = kDefaultMaxMinutes,
+    this.requirePing = true,
   }) : _maxMinutes = _clampMax(maxMinutes);
+
+  /// Ringkasan presence untuk log/snackbar: siapa saja yang ter-track.
+  /// Memakai dynamic supaya tidak tergantung bentuk presenceState() per versi.
+  String presenceSummary() {
+    try {
+      final dynamic state = _channel?.presenceState();
+      if (state == null) return 'channel belum siap';
+      // key -> daftar umur (detik) tiap meta + role/host terakhir.
+      final ages = <String, List<int>>{};
+      final info = <String, String>{};
+      void add(dynamic key, dynamic payload) {
+        final k = '$key';
+        final m = payload is Map ? payload : const {};
+        final at = m['at'];
+        final s = at is num
+            ? DateTime.now()
+                  .difference(DateTime.fromMillisecondsSinceEpoch(at.toInt()))
+                  .inSeconds
+            : -1;
+        (ages[k] ??= <int>[]).add(s);
+        final host = m['host'];
+        info[k] =
+            '${m['role'] ?? '?'}${m['env'] != null ? '/${m['env']}' : ''}'
+            '${host != null ? '@$host' : ''}';
+      }
+
+      if (state is Map) {
+        state.forEach((k, v) {
+          final list = v is Iterable ? v : [v];
+          for (final e in list) {
+            add(k, (e as dynamic).payload);
+          }
+        });
+      } else if (state is Iterable) {
+        for (final e in state) {
+          final dynamic d = e;
+          for (final pr in (d.presences as Iterable)) {
+            add(d.key, (pr as dynamic).payload);
+          }
+        }
+      }
+      if (ages.isEmpty) return 'kosong';
+      String fmt(int s) =>
+          s < 0 ? '?' : (s < 90 ? '${s}dtk' : '${(s / 60).round()}mnt');
+      final parts = ages.entries.map((e) {
+        final l = e.value..sort();
+        final range = l.first == l.last
+            ? fmt(l.first)
+            : '${fmt(l.first)}-${fmt(l.last)}';
+        return '${e.key}${l.length > 1 ? ' x${l.length}' : ''}'
+            '(${info[e.key]}, track $range lalu)';
+      }).toList();
+      final total = ages.values.fold<int>(0, (a, b) => a + b.length);
+      return '${ages.length} key/$total meta: ${parts.join(', ')}';
+    } catch (e) {
+      return 'presence tidak terbaca ($e)';
+    }
+  }
+
+  /// Satu baris status lengkap untuk snackbar J2.
+  String describe() {
+    final ping = requirePing
+        ? (_pingFresh
+              ? 'ping segar'
+              : (_graceActive ? 'menunggu ping pertama' : 'TANPA ping'))
+        : 'ping tidak diwajibkan';
+    return 'presence ${presenceSummary()}; $ping';
+  }
 
   static int _clampMax(int v) => v.clamp(0, kMaxMinutesCeil).toInt();
 
@@ -118,8 +227,24 @@ class LiveCamService {
   }
 
   void _createChannel() {
-    final ch = _client.channel(channelName);
+    // self: true -> broadcast yang kita kirim ikut kembali ke kita (dipakai probe).
+    final ch = _client.channel(
+      channelName,
+      opts: const RealtimeChannelConfig(self: true),
+    );
     _channel = ch;
+    _isSubscribed = false;
+    _stopProbe();
+    _joinWatch?.cancel();
+    _joinWatch = Timer(kJoinWatchdog, () {
+      if (_disposed || !identical(_channel, ch) || _isSubscribed) return;
+      onLog?.call(
+        LogDirection.error,
+        'CAM',
+        'Channel live-cam belum subscribed setelah ${kJoinWatchdog.inSeconds} dtk -> dibangun ulang',
+      );
+      _scheduleResubscribe();
+    });
     ch
       ..onPresenceSync((_) {
         if (identical(_channel, ch)) _recompute();
@@ -132,6 +257,12 @@ class LiveCamService {
       })
       // TODO verifikasi: signature onBroadcast di supabase_flutter ^2.17.2
       // (event: String, callback: void Function(Map<String, dynamic>)).
+      ..onBroadcast(
+        event: 'hb',
+        callback: (p) {
+          if (identical(_channel, ch)) _onProbeEcho(p);
+        },
+      )
       ..onBroadcast(
         event: 'ping',
         callback: (_) {
@@ -148,6 +279,11 @@ class LiveCamService {
   ) {
     if (_disposed || !identical(_channel, ch)) return;
     if (status == RealtimeSubscribeStatus.subscribed) {
+      _isSubscribed = true;
+      _joinWatch?.cancel();
+      _startProbe();
+      // Cek "tuli" segera, jangan tunggu satu siklus penuh.
+      Future<void>.delayed(const Duration(seconds: 3), _probe);
       _backoff = kResubscribeMin;
       _resubTimer?.cancel();
       _resubTimer = null;
@@ -163,6 +299,8 @@ class LiveCamService {
     if (status == RealtimeSubscribeStatus.closed ||
         status == RealtimeSubscribeStatus.timedOut ||
         status == RealtimeSubscribeStatus.channelError) {
+      _isSubscribed = false;
+      _stopProbe();
       onLog?.call(
         LogDirection.error,
         'CAM',
@@ -200,6 +338,120 @@ class LiveCamService {
     });
   }
 
+  // ---------------- PROBE LOOPBACK ----------------
+
+  void _startProbe() {
+    _probeTimer?.cancel();
+    _probeTimer = Timer.periodic(kProbeEvery, (_) => _probe());
+  }
+
+  void _stopProbe() {
+    _probeTimer?.cancel();
+    _probeTimer = null;
+    _probeWaitTimer?.cancel();
+    _probeWaitTimer = null;
+    _probeId = null;
+  }
+
+  Future<void> _probe() async {
+    final ch = _channel;
+    if (_disposed || ch == null || !_isSubscribed) return;
+    if (_probeWaitTimer != null) return; // probe sebelumnya belum selesai
+    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    _probeId = id;
+    _probeWaitTimer = Timer(kProbeWait, () {
+      _probeWaitTimer = null;
+      if (_disposed || !identical(_channel, ch) || _probeId != id) return;
+      _probeId = null;
+      _probeFails++;
+      onLog?.call(
+        LogDirection.error,
+        'CAM',
+        'Probe live-cam GAGAL ($_probeFails x): broadcast sendiri tidak kembali '
+            'dalam ${kProbeWait.inSeconds} dtk -> channel dianggap tuli',
+      );
+      _recoverDeafChannel();
+    });
+    try {
+      await ch.sendBroadcastMessage(event: 'hb', payload: {'id': id});
+    } catch (e) {
+      // Kegagalan kirim biarkan ditangkap timer di atas (tidak ada echo).
+    }
+  }
+
+  void _onProbeEcho(dynamic p) {
+    final dynamic m = (p is Map && p['payload'] is Map) ? p['payload'] : p;
+    final id = m is Map ? m['id'] : null;
+    if (id == null || id != _probeId) return;
+    _probeId = null;
+    _probeWaitTimer?.cancel();
+    _probeWaitTimer = null;
+    if (_probeFails > 0) {
+      onLog?.call(
+        LogDirection.info,
+        'CAM',
+        'Probe live-cam OK lagi (sebelumnya gagal $_probeFails x)',
+      );
+      _probeFails = 0;
+    }
+  }
+
+  void _recoverDeafChannel() {
+    if (_probeFails >= 2) {
+      final last = _lastSocketReconnectAt;
+      if (last == null ||
+          DateTime.now().difference(last) >= kSocketReconnectMinGap) {
+        _reconnectSocket();
+        return;
+      }
+    }
+    _scheduleResubscribe();
+  }
+
+  Future<void> _reconnectSocket() async {
+    _lastSocketReconnectAt = DateTime.now();
+    onLog?.call(
+      LogDirection.error,
+      'CAM',
+      'Probe gagal berturut-turut -> reconnect socket realtime',
+    );
+    try {
+      _client.realtime.disconnect();
+    } catch (_) {}
+    await Future<void>.delayed(const Duration(seconds: 2));
+    if (_disposed) return;
+    try {
+      _client.realtime.connect();
+    } catch (_) {}
+    _scheduleResubscribe(); // bangun ulang channel livecam setelah socket naik
+  }
+
+  void _armGrace() {
+    _graceTimer?.cancel();
+    _graceActive = true;
+    _graceTimer = Timer(kJoinGrace, () {
+      _graceTimer = null;
+      if (_disposed) return;
+      _graceActive = false;
+      if (requirePing && !_pingFresh) {
+        onLog?.call(
+          LogDirection.info,
+          'CAM',
+          'Viewer live-cam ada di presence tapi tidak mengirim ping '
+              '${kJoinGrace.inSeconds} dtk -> diabaikan (presence basi/"hantu"?). '
+              'Presence: ${presenceSummary()}',
+        );
+      }
+      _recompute();
+    });
+  }
+
+  void _cancelGrace() {
+    _graceTimer?.cancel();
+    _graceTimer = null;
+    _graceActive = false;
+  }
+
   void _onPing() {
     if (_disposed) return;
     _pingSeen = true;
@@ -211,11 +463,33 @@ class LiveCamService {
       onLog?.call(
         LogDirection.info,
         'CAM',
-        'Viewer live-cam 60 dtk tanpa ping -> dianggap hilang',
+        'Viewer live-cam ${kPingTimeout.inSeconds} dtk tanpa ping -> dianggap hilang',
       );
       _recompute();
     });
     _recompute(); // pulih bila sebelumnya dianggap hilang
+    _sendPong(); // setelah _recompute supaya `active` di pong sudah terbaru
+  }
+
+  /// Balasan kecil atas tiap ping viewer, supaya webapp bisa membedakan
+  /// "J2 tidak mendengar channel ini sama sekali" dari "J2 mendengar tapi
+  /// belum mengirim frame". Hanya dikirim saat ada ping (= ada yang nonton),
+  /// jadi tidak ada trafik saat idle.
+  Future<void> _sendPong() async {
+    final ch = _channel;
+    if (ch == null || _disposed || !_isSubscribed) return;
+    try {
+      await ch.sendBroadcastMessage(
+        event: 'pong',
+        payload: {
+          'ts': DateTime.now().millisecondsSinceEpoch,
+          'active': _lastActive,
+          'capped': _capped,
+        },
+      );
+    } catch (_) {
+      // diam: kegagalan kirim pong tidak boleh mengganggu apa pun
+    }
   }
 
   void _resetPing() {
@@ -232,21 +506,41 @@ class LiveCamService {
     final state = _channel?.presenceState();
     final present = state != null && state.isNotEmpty;
 
-    if (!present) {
-      _resetPing();
-      _capped = false;
-    }
-    if (join) {
-      // Viewer baru: ping lama tidak berlaku (viewer lama bisa tanpa ping)
-      // dan batas durasi dimulai lagi.
-      _resetPing();
-      if (present) {
+    if (requirePing) {
+      // Ping = SATU-SATUNYA sumber kebenaran. Presence (termasuk entri "hantu")
+      // hanya untuk log; kamera nyala di ping pertama, tanpa menunggu sync/grace.
+      if (!_pingFresh) {
+        _capped = false;
+        _activeSince = null;
+      } else if (join && _capped) {
+        // Viewer baru join saat batas durasi tercapai: mulai hitung lagi.
         _capped = false;
         _activeSince = DateTime.now();
       }
+    } else {
+      if (!present) {
+        _resetPing();
+        _cancelGrace();
+        _capped = false;
+      }
+      if (join) {
+        _resetPing();
+        if (present) {
+          _capped = false;
+          _activeSince = DateTime.now();
+        }
+      }
     }
 
-    final active = present && (!_pingSeen || _pingFresh) && !_capped;
+    final active = requirePing
+        ? (_pingFresh && !_capped)
+        : (present && (!_pingSeen || _pingFresh) && !_capped);
+
+    final summary = presenceSummary();
+    if (summary != _lastSummary) {
+      _lastSummary = summary;
+      onLog?.call(LogDirection.info, 'CAM', 'Presence live-cam: $summary');
+    }
     if (active == _lastActive) return; // no-op kalau memang gak berubah
     _lastActive = active;
     if (active) {
@@ -275,7 +569,7 @@ class LiveCamService {
         LogDirection.info,
         'CAM',
         'Batas live-cam $_maxMinutes menit tercapai -> berhenti kirim frame '
-        '(buka ulang panel untuk lanjut)',
+            '(buka ulang panel untuk lanjut)',
       );
       _recompute(); // -> active=false -> onWatchersChanged(false)
       return;
@@ -336,6 +630,11 @@ class LiveCamService {
     _resubTimer = null;
     _pingTimer?.cancel();
     _pingTimer = null;
+    _graceTimer?.cancel();
+    _graceTimer = null;
+    _joinWatch?.cancel();
+    _joinWatch = null;
+    _stopProbe();
     final channel = _channel;
     _channel = null;
     if (channel != null) _client.removeChannel(channel);

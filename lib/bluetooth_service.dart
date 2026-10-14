@@ -48,6 +48,16 @@ class BluetoothService {
 
   final void Function(bool connected)? onConnectionChanged;
 
+  /// ROOM 2: dipanggil SEKALI per paket JSON yang membawa `sys.rr` (ESP baru
+  /// reboot). [reason] = esp_reset_reason; [intentional] = true bila J2
+  /// mengirim rst:1/rst:2 dalam 60 detik terakhir; [at] = jam J2 saat paket
+  /// diterima. SENGAJA dibaca dari JSON mentah, BUKAN dari TelemetryPacket
+  /// hasil merge `previous` -- supaya rr lama tidak terulang di paket mini.
+  final void Function(int reason, bool intentional, DateTime at)? onEspReboot;
+
+  /// ROOM 2: kapan terakhir J2 BERHASIL mengirim rst (1/2) ke ESP.
+  DateTime? _lastRstSentAt;
+
   /// Log ringkas untuk panel Dev (koneksi, command keluar, error).
   /// Sukses terima telemetri SENGAJA tidak di-log di sini -- itu
   /// dirangkum & di-log oleh caller (feeding_screen) dalam format yang
@@ -62,6 +72,7 @@ class BluetoothService {
     this.onTelemetry,
     this.onUnknownPayload,
     this.onConnectionChanged,
+    this.onEspReboot,
     this.onLog,
     this.targetDeviceName = 'ESP32_Aquaponics',
   });
@@ -201,6 +212,22 @@ class BluetoothService {
         final map = jsonDecode(payload) as Map<String, dynamic>;
         final packet = TelemetryPacket.fromJson(map, previous: _lastPacket);
         _lastPacket = packet;
+        // ROOM 2: sys.rr ada & bukan null = ESP baru reboot. Satu-satunya
+        // sinyal reboot; tidak ada tebakan dari cara lain.
+        final sys = map['sys'];
+        if (sys is Map && sys['rr'] is num) {
+          final rr = (sys['rr'] as num).toInt();
+          final at = DateTime.now();
+          final sentAt = _lastRstSentAt;
+          final intentional =
+              sentAt != null &&
+              at.difference(sentAt) <= const Duration(seconds: 60);
+          try {
+            onEspReboot?.call(rr, intentional, at);
+          } catch (e) {
+            onLog?.call(LogDirection.error, 'BT', 'Gagal proses sys.rr: $e');
+          }
+        }
         onTelemetry?.call(packet);
       } catch (e) {
         onLog?.call(
@@ -322,7 +349,7 @@ class BluetoothService {
   }
 
   /// 🟢 REVISI: batas aman paket cfg (ESP membuang diam-diam di atas 1024).
-  static const int _cfgMaxPacketLen = 800;
+  static const int _cfgMaxPacketLen = 400;
 
   /// 🟢 REVISI: panjang paket penuh `<{"cfg":...}>` dalam BYTE UTF-8
   /// (ESP menghitung byte, bukan code unit Dart).
@@ -363,7 +390,9 @@ class BluetoothService {
   /// ESP.restart() begitu paket ini diterima -- tidak perlu ubah kode
   /// ESP sama sekali, firmware sudah menangani ini (lihat CommsBT.cpp).
   Future<void> sendReset(int rst) async {
-    await _sendJson({'rst': rst});
+    final ok = await _sendJson({'rst': rst});
+    // ROOM 2: catat HANYA bila benar-benar terkirim (dasar flag intentional).
+    if (ok && (rst == 1 || rst == 2)) _lastRstSentAt = DateTime.now();
   }
 
   /// 🟢 REVISI: sinkronisasi jam RTC ESP. [epochWib] = detik sejak epoch
