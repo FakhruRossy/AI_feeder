@@ -224,6 +224,7 @@ class _FeedingScreenState extends State<FeedingScreen>
   // supaya J2 cuma meneruskan PERUBAHAN (edge), bukan isi baris.
   // ---------------------------------------------------------------------
   final Map<String, int> _lastOvr = {};
+  final Map<String, int> _lastSeenDbOvr = {};
   // 🟢 FIX BUG "override pompa/charger stuck di 1" (item 1): timestamp
   // kapan J2 TERAKHIR KALI mengirim tiap kunci ovr, dipakai supaya
   // sinkronisasi balik dari telemetri (lihat _syncOverrideGateFromTelemetry)
@@ -330,7 +331,8 @@ class _FeedingScreenState extends State<FeedingScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    _devLog = DevLogBuffer(maxLines: widget.config.devLogMaxLines);
+    // _devLog = DevLogBuffer(maxLines: widget.config.devLogMaxLines);
+    _devLog = DevLogBuffer(maxLines: 500);
 
     final rowId = int.tryParse(widget.config.supabaseRowId) ?? 1;
     _supabase = FeederSupabaseService(
@@ -709,31 +711,49 @@ class _FeedingScreenState extends State<FeedingScreen>
   /// supaya tidak toggle bolak-balik tiap kali baterai nyeberang satu
   /// angka persis di satu threshold tunggal. Di ANTARA cmin..cmax, target
   /// dibiarkan apa adanya (tidak dipaksa ke arah mana pun).
-  void _maintainChargerFromBattery(int battPct) {
-    // 🟢 REVISI: BT putus -> jangan evaluasi. Kalau dievaluasi, target ditandai
-    // "terkirim" padahal sendOverride gagal (belum konek) dan ovr.c ikut
-    // ditulis ke Supabase untuk perintah yang tidak pernah sampai ke ESP.
-    if (!_isBtConnected) return;
-    if (!_remoteBaselineReady) return; // belum tahu ovr.c yang benar
+  DateTime? _lastChargerDiagAt;
 
+  void _maintainChargerFromBattery(int battPct, bool espChargerOn) {
     final cmin = (_lastCfg['cmin'] as num?)?.toInt();
     final cmax = (_lastCfg['cmax'] as num?)?.toInt();
-    if (cmin == null || cmax == null) return; // cfg belum diterima dari ESP
+
+    // Log penahan, maks 1x per 5 menit, supaya sebab "diam" tidak hilang lagi.
+    void why(String reason) {
+      final now = DateTime.now();
+      if (_lastChargerDiagAt != null &&
+          now.difference(_lastChargerDiagAt!) < const Duration(minutes: 5)) {
+        return;
+      }
+      _lastChargerDiagAt = now;
+      _devLog.add(
+        LogDirection.info,
+        'HP',
+        'Auto charger ditahan ($reason): baterai $battPct%, cmin=$cmin, charger ESP=${espChargerOn ? "ON" : "OFF"}',
+      );
+    }
 
     bool? target;
-    if (battPct <= cmin) {
+    if (cmin != null && battPct <= cmin) {
       target = true;
-    } else if (battPct >= cmax) {
+    } else if (cmax != null && battPct >= cmax) {
       target = false;
     }
-    if (target == null || target == _lastChargerAutoTarget) return;
+    if (target == null) return; // di antara cmin..cmax
+    if (espChargerOn == target) return; // kenyataan ESP sudah sesuai
 
-    _lastChargerAutoTarget = target;
-    if (_lastOvr['c'] == (target ? 1 : 0))
-      return; // sudah sesuai, gak perlu kirim ulang
+    if (!_isBtConnected) return why('BT putus');
+    if (!_remoteBaselineReady) return why('baseline belum siap');
+    if (cmin == null || cmax == null) return why('cfg kosong');
+
+    final now = DateTime.now();
+    final lastSent = _lastOvrSentAt['c'];
+    if (lastSent != null &&
+        now.difference(lastSent) < const Duration(seconds: 30)) {
+      return; // beri waktu ESP merespons sebelum diulang
+    }
 
     _lastOvr['c'] = target ? 1 : 0;
-    _lastOvrSentAt['c'] = DateTime.now();
+    _lastOvrSentAt['c'] = now;
     _devLog.add(
       LogDirection.info,
       'HP',
@@ -759,7 +779,7 @@ class _FeedingScreenState extends State<FeedingScreen>
       _devLog.add(LogDirection.error, 'HP', 'Gagal baca baterai: $e');
     }
 
-    _maintainChargerFromBattery(battPct);
+    _maintainChargerFromBattery(battPct, packet.actuator.charger);
 
     return {
       ...packet.toSupabaseRow(),
@@ -1137,7 +1157,11 @@ class _FeedingScreenState extends State<FeedingScreen>
         final raw = ovr[key];
         if (raw is! num) continue;
         final value = raw.toInt();
-        if (_lastOvr[key] == value) continue; // nilai lama -> JANGAN diulang
+        final seenBefore = _lastSeenDbOvr[key];
+        _lastSeenDbOvr[key] = value;
+        if (seenBefore == value)
+          continue; // DB tidak berubah -> bukan perintah baru
+        if (_lastOvr[key] == value) continue; // gate lama tetap dipertahankan
         _lastOvr[key] = value;
         _lastOvrSentAt[key] = DateTime.now();
         if (key == 'p') pump = value == 1;
